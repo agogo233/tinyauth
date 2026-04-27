@@ -48,3 +48,4 @@ __debug_*
 
 # testing config
 config.certify.yml
+AGENTS.md
