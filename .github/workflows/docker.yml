@@ -57,6 +57,10 @@ jobs:
           tags: |
             ghcr.io/${{ env.LOWER_NAME }}:latest
 
+      - name: 显示 Docker 镜像大小
+        run: |
+          docker images ghcr.io/${{ env.LOWER_NAME }}:latest --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}"
+
       - uses: actions/delete-package-versions@v5
         with: 
           package-name: ${{ env.CONTAINER_NAME }}
