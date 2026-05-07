@@ -59,6 +59,7 @@ func NewDefaultConfiguration() *Config {
 		Experimental: ExperimentalConfig{
 			ConfigFile: "",
 		},
+		LabelProvider: "auto",
 	}
 }
 
@@ -76,21 +77,21 @@ var RedirectCookieName = "tinyauth-redirect"
 var OAuthSessionCookieName = "tinyauth-oauth"
 
 // Main app config
-
 type Config struct {
-	AppURL       string             `description:"The base URL where the app is hosted." yaml:"appUrl"`
-	Database     DatabaseConfig     `description:"Database configuration." yaml:"database"`
-	Analytics    AnalyticsConfig    `description:"Analytics configuration." yaml:"analytics"`
-	Resources    ResourcesConfig    `description:"Resources configuration." yaml:"resources"`
-	Server       ServerConfig       `description:"Server configuration." yaml:"server"`
-	Auth         AuthConfig         `description:"Authentication configuration." yaml:"auth"`
-	Apps         map[string]App     `description:"Application ACLs configuration." yaml:"apps"`
-	OAuth        OAuthConfig        `description:"OAuth configuration." yaml:"oauth"`
-	OIDC         OIDCConfig         `description:"OIDC configuration." yaml:"oidc"`
-	UI           UIConfig           `description:"UI customization." yaml:"ui"`
-	Ldap         LdapConfig         `description:"LDAP configuration." yaml:"ldap"`
-	Experimental ExperimentalConfig `description:"Experimental features, use with caution." yaml:"experimental"`
-	Log          LogConfig          `description:"Logging configuration." yaml:"log"`
+	AppURL        string             `description:"The base URL where the app is hosted." yaml:"appUrl"`
+	Database      DatabaseConfig     `description:"Database configuration." yaml:"database"`
+	Analytics     AnalyticsConfig    `description:"Analytics configuration." yaml:"analytics"`
+	Resources     ResourcesConfig    `description:"Resources configuration." yaml:"resources"`
+	Server        ServerConfig       `description:"Server configuration." yaml:"server"`
+	Auth          AuthConfig         `description:"Authentication configuration." yaml:"auth"`
+	Apps          map[string]App     `description:"Application ACLs configuration." yaml:"apps"`
+	OAuth         OAuthConfig        `description:"OAuth configuration." yaml:"oauth"`
+	OIDC          OIDCConfig         `description:"OIDC configuration." yaml:"oidc"`
+	UI            UIConfig           `description:"UI customization." yaml:"ui"`
+	Ldap          LdapConfig         `description:"LDAP configuration." yaml:"ldap"`
+	Experimental  ExperimentalConfig `description:"Experimental features, use with caution." yaml:"experimental"`
+	LabelProvider string             `description:"Label provider to use for ACLs (auto, docker, or kubernetes). auto detects the environment." yaml:"labelProvider"`
+	Log           LogConfig          `description:"Logging configuration." yaml:"log"`
 }
 
 type DatabaseConfig struct {
@@ -113,15 +114,43 @@ type ServerConfig struct {
 }
 
 type AuthConfig struct {
-	IP                 IPConfig `description:"IP whitelisting config options." yaml:"ip"`
-	Users              []string `description:"Comma-separated list of users (username:hashed_password)." yaml:"users"`
-	UsersFile          string   `description:"Path to the users file." yaml:"usersFile"`
-	SecureCookie       bool     `description:"Enable secure cookies." yaml:"secureCookie"`
-	SessionExpiry      int      `description:"Session expiry time in seconds." yaml:"sessionExpiry"`
-	SessionMaxLifetime int      `description:"Maximum session lifetime in seconds." yaml:"sessionMaxLifetime"`
-	LoginTimeout       int      `description:"Login timeout in seconds." yaml:"loginTimeout"`
-	LoginMaxRetries    int      `description:"Maximum login retries." yaml:"loginMaxRetries"`
-	TrustedProxies     []string `description:"Comma-separated list of trusted proxy addresses." yaml:"trustedProxies"`
+	IP                 IPConfig                  `description:"IP whitelisting config options." yaml:"ip"`
+	Users              []string                  `description:"Comma-separated list of users (username:hashed_password)." yaml:"users"`
+	UserAttributes     map[string]UserAttributes `description:"Map of per-user OIDC attributes (username -> attributes)." yaml:"userAttributes"`
+	UsersFile          string                    `description:"Path to the users file." yaml:"usersFile"`
+	SecureCookie       bool                      `description:"Enable secure cookies." yaml:"secureCookie"`
+	SessionExpiry      int                       `description:"Session expiry time in seconds." yaml:"sessionExpiry"`
+	SessionMaxLifetime int                       `description:"Maximum session lifetime in seconds." yaml:"sessionMaxLifetime"`
+	LoginTimeout       int                       `description:"Login timeout in seconds." yaml:"loginTimeout"`
+	LoginMaxRetries    int                       `description:"Maximum login retries." yaml:"loginMaxRetries"`
+	TrustedProxies     []string                  `description:"Comma-separated list of trusted proxy addresses." yaml:"trustedProxies"`
+}
+
+type UserAttributes struct {
+	Name        string       `description:"Full name of the user." yaml:"name"`
+	GivenName   string       `description:"Given (first) name of the user." yaml:"givenName"`
+	FamilyName  string       `description:"Family (last) name of the user." yaml:"familyName"`
+	MiddleName  string       `description:"Middle name of the user." yaml:"middleName"`
+	Nickname    string       `description:"Nickname of the user." yaml:"nickname"`
+	Profile     string       `description:"URL of the user's profile page." yaml:"profile"`
+	Picture     string       `description:"URL of the user's profile picture." yaml:"picture"`
+	Website     string       `description:"URL of the user's website." yaml:"website"`
+	Email       string       `description:"Email address of the user." yaml:"email"`
+	Gender      string       `description:"Gender of the user." yaml:"gender"`
+	Birthdate   string       `description:"Birthdate of the user (YYYY-MM-DD)." yaml:"birthdate"`
+	Zoneinfo    string       `description:"Time zone of the user (e.g. Europe/Athens)." yaml:"zoneinfo"`
+	Locale      string       `description:"Locale of the user (e.g. en-US)." yaml:"locale"`
+	PhoneNumber string       `description:"Phone number of the user." yaml:"phoneNumber"`
+	Address     AddressClaim `description:"Address of the user." yaml:"address"`
+}
+
+type AddressClaim struct {
+	Formatted     string `description:"Full mailing address, formatted for display." yaml:"formatted" json:"formatted,omitempty"`
+	StreetAddress string `description:"Street address." yaml:"streetAddress" json:"street_address,omitempty"`
+	Locality      string `description:"City or locality." yaml:"locality" json:"locality,omitempty"`
+	Region        string `description:"State, province, or region." yaml:"region" json:"region,omitempty"`
+	PostalCode    string `description:"Zip or postal code." yaml:"postalCode" json:"postal_code,omitempty"`
+	Country       string `description:"Country." yaml:"country" json:"country,omitempty"`
 }
 
 type IPConfig struct {
@@ -228,6 +257,7 @@ type User struct {
 	Username   string
 	Password   string
 	TotpSecret string
+	Attributes UserAttributes
 }
 
 type LdapUser struct {
@@ -254,6 +284,7 @@ type UserContext struct {
 	OAuthName   string
 	OAuthSub    string
 	LdapGroups  string
+	Attributes  UserAttributes
 }
 
 // API responses and queries
