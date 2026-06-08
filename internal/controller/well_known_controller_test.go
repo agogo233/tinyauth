@@ -1,41 +1,28 @@
 package controller_test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http/httptest"
-	"path"
 	"testing"
 
 	"github.com/gin-gonic/gin"
-	"github.com/tinyauthapp/tinyauth/internal/bootstrap"
-	"github.com/tinyauthapp/tinyauth/internal/config"
-	"github.com/tinyauthapp/tinyauth/internal/controller"
-	"github.com/tinyauthapp/tinyauth/internal/repository"
-	"github.com/tinyauthapp/tinyauth/internal/service"
-	"github.com/tinyauthapp/tinyauth/internal/utils/tlog"
+	"github.com/steveiliop56/ding"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tinyauthapp/tinyauth/internal/controller"
+	"github.com/tinyauthapp/tinyauth/internal/repository/memory"
+	"github.com/tinyauthapp/tinyauth/internal/service"
+	"github.com/tinyauthapp/tinyauth/internal/test"
+	"github.com/tinyauthapp/tinyauth/internal/utils/logger"
 )
 
 func TestWellKnownController(t *testing.T) {
-	tlog.NewTestLogger().Init()
-	tempDir := t.TempDir()
+	log := logger.NewLogger().WithTestConfig()
+	log.Init()
 
-	oidcServiceCfg := service.OIDCServiceConfig{
-		Clients: map[string]config.OIDCClientConfig{
-			"test": {
-				ClientID:            "some-client-id",
-				ClientSecret:        "some-client-secret",
-				TrustedRedirectURIs: []string{"https://test.example.com/callback"},
-				Name:                "Test Client",
-			},
-		},
-		PrivateKeyPath: path.Join(tempDir, "key.pem"),
-		PublicKeyPath:  path.Join(tempDir, "key.pub"),
-		Issuer:         "https://tinyauth.example.com",
-		SessionExpiry:  500,
-	}
+	cfg, runtime := test.CreateTestConfigs(t)
 
 	type testCase struct {
 		description string
@@ -56,11 +43,11 @@ func TestWellKnownController(t *testing.T) {
 				assert.NoError(t, err)
 
 				expected := controller.OpenIDConnectConfiguration{
-					Issuer:                                 oidcServiceCfg.Issuer,
-					AuthorizationEndpoint:                  fmt.Sprintf("%s/authorize", oidcServiceCfg.Issuer),
-					TokenEndpoint:                          fmt.Sprintf("%s/api/oidc/token", oidcServiceCfg.Issuer),
-					UserinfoEndpoint:                       fmt.Sprintf("%s/api/oidc/userinfo", oidcServiceCfg.Issuer),
-					JwksUri:                                fmt.Sprintf("%s/.well-known/jwks.json", oidcServiceCfg.Issuer),
+					Issuer:                                 runtime.AppURL,
+					AuthorizationEndpoint:                  fmt.Sprintf("%s/authorize", runtime.AppURL),
+					TokenEndpoint:                          fmt.Sprintf("%s/api/oidc/token", runtime.AppURL),
+					UserinfoEndpoint:                       fmt.Sprintf("%s/api/oidc/userinfo", runtime.AppURL),
+					JwksUri:                                fmt.Sprintf("%s/.well-known/jwks.json", runtime.AppURL),
 					ScopesSupported:                        service.SupportedScopes,
 					ResponseTypesSupported:                 service.SupportedResponseTypes,
 					GrantTypesSupported:                    service.SupportedGrantTypes,
@@ -101,15 +88,12 @@ func TestWellKnownController(t *testing.T) {
 		},
 	}
 
-	app := bootstrap.NewBootstrapApp(config.Config{})
+	ctx := context.TODO()
+	dg := ding.New(ctx)
 
-	db, err := app.SetupDatabase(path.Join(tempDir, "tinyauth.db"))
-	require.NoError(t, err)
+	store := memory.New()
 
-	queries := repository.New(db)
-
-	oidcService := service.NewOIDCService(oidcServiceCfg, queries)
-	err = oidcService.Init()
+	oidcService, err := service.NewOIDCService(log, cfg, runtime, store, dg)
 	require.NoError(t, err)
 
 	for _, test := range tests {
@@ -119,15 +103,9 @@ func TestWellKnownController(t *testing.T) {
 
 			recorder := httptest.NewRecorder()
 
-			wellKnownController := controller.NewWellKnownController(controller.WellKnownControllerConfig{}, oidcService, router)
-			wellKnownController.SetupRoutes()
+			controller.NewWellKnownController(oidcService, &router.RouterGroup)
 
 			test.run(t, router, recorder)
 		})
 	}
-
-	t.Cleanup(func() {
-		err = db.Close()
-		require.NoError(t, err)
-	})
 }

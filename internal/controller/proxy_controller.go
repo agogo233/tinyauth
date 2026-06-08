@@ -3,15 +3,16 @@ package controller
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
 
-	"github.com/tinyauthapp/tinyauth/internal/config"
+	"github.com/tinyauthapp/tinyauth/internal/model"
 	"github.com/tinyauthapp/tinyauth/internal/service"
 	"github.com/tinyauthapp/tinyauth/internal/utils"
-	"github.com/tinyauthapp/tinyauth/internal/utils/tlog"
+	"github.com/tinyauthapp/tinyauth/internal/utils/logger"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/go-querystring/query"
@@ -50,29 +51,34 @@ type ProxyContext struct {
 	ProxyType ProxyType
 }
 
-type ProxyControllerConfig struct {
-	AppURL string
-}
-
 type ProxyController struct {
-	config ProxyControllerConfig
-	router *gin.RouterGroup
-	acls   *service.AccessControlsService
-	auth   *service.AuthService
+	log          *logger.Logger
+	runtime      model.RuntimeConfig
+	acls         *service.AccessControlsService
+	auth         *service.AuthService
+	policyEngine *service.PolicyEngine
 }
 
-func NewProxyController(config ProxyControllerConfig, router *gin.RouterGroup, acls *service.AccessControlsService, auth *service.AuthService) *ProxyController {
-	return &ProxyController{
-		config: config,
-		router: router,
-		acls:   acls,
-		auth:   auth,
+func NewProxyController(
+	log *logger.Logger,
+	runtime model.RuntimeConfig,
+	router *gin.RouterGroup,
+	acls *service.AccessControlsService,
+	auth *service.AuthService,
+	policyEngine *service.PolicyEngine,
+) *ProxyController {
+	controller := &ProxyController{
+		log:          log,
+		runtime:      runtime,
+		acls:         acls,
+		auth:         auth,
+		policyEngine: policyEngine,
 	}
-}
 
-func (controller *ProxyController) SetupRoutes() {
-	proxyGroup := controller.router.Group("/auth")
+	proxyGroup := router.Group("/auth")
 	proxyGroup.Any("/:proxy", controller.proxyHandler)
+
+	return controller
 }
 
 func (controller *ProxyController) proxyHandler(c *gin.Context) {
@@ -80,7 +86,7 @@ func (controller *ProxyController) proxyHandler(c *gin.Context) {
 	proxyCtx, err := controller.getProxyContext(c)
 
 	if err != nil {
-		tlog.App.Warn().Err(err).Msg("Failed to get proxy context")
+		controller.log.App.Error().Err(err).Msg("Failed to get proxy context from request")
 		c.JSON(400, gin.H{
 			"status":  400,
 			"message": "Bad request",
@@ -88,22 +94,24 @@ func (controller *ProxyController) proxyHandler(c *gin.Context) {
 		return
 	}
 
-	tlog.App.Trace().Interface("ctx", proxyCtx).Msg("Got proxy context")
-
 	// Get acls
 	acls, err := controller.acls.GetAccessControls(proxyCtx.Host)
 
 	if err != nil {
-		tlog.App.Error().Err(err).Msg("Failed to get access controls for resource")
+		controller.log.App.Error().Err(err).Msg("Failed to get ACLs for resource")
 		controller.handleError(c, proxyCtx)
 		return
 	}
-
-	tlog.App.Trace().Interface("acls", acls).Msg("ACLs for resource")
 
 	clientIP := c.ClientIP()
 
-	if controller.auth.IsBypassedIP(acls.IP, clientIP) {
+	aclsCtx := &service.ACLContext{
+		ACLs: acls,
+		IP:   net.ParseIP(clientIP),
+		Path: proxyCtx.Path,
+	}
+
+	if controller.policyEngine.Evaluate(service.RuleIPBypassed, aclsCtx) {
 		controller.setHeaders(c, acls)
 		c.JSON(200, gin.H{
 			"status":  200,
@@ -112,16 +120,8 @@ func (controller *ProxyController) proxyHandler(c *gin.Context) {
 		return
 	}
 
-	authEnabled, err := controller.auth.IsAuthEnabled(proxyCtx.Path, acls.Path)
-
-	if err != nil {
-		tlog.App.Error().Err(err).Msg("Failed to check if auth is enabled for resource")
-		controller.handleError(c, proxyCtx)
-		return
-	}
-
-	if !authEnabled {
-		tlog.App.Debug().Msg("Authentication disabled for resource, allowing access")
+	if controller.policyEngine.Evaluate(service.RuleAuthEnabled, aclsCtx) {
+		controller.log.App.Debug().Msg("Authentication is disabled for this resource, allowing access without authentication")
 		controller.setHeaders(c, acls)
 		c.JSON(200, gin.H{
 			"status":  200,
@@ -130,25 +130,25 @@ func (controller *ProxyController) proxyHandler(c *gin.Context) {
 		return
 	}
 
-	if !controller.auth.CheckIP(acls.IP, clientIP) {
-		queries, err := query.Values(config.UnauthorizedQuery{
+	if !controller.policyEngine.Evaluate(service.RuleIPAllowed, aclsCtx) {
+		queries, err := query.Values(UnauthorizedQuery{
 			Resource: strings.Split(proxyCtx.Host, ".")[0],
 			IP:       clientIP,
 		})
 
 		if err != nil {
-			tlog.App.Error().Err(err).Msg("Failed to encode unauthorized query")
+			controller.log.App.Error().Err(err).Msg("Failed to encode unauthorized query")
 			controller.handleError(c, proxyCtx)
 			return
 		}
 
-		redirectURL := fmt.Sprintf("%s/unauthorized?%s", controller.config.AppURL, queries.Encode())
+		redirectURL := fmt.Sprintf("%s/unauthorized?%s", controller.runtime.AppURL, queries.Encode())
 
 		if !controller.useBrowserResponse(proxyCtx) {
 			c.Header("x-tinyauth-location", redirectURL)
-			c.JSON(401, gin.H{
-				"status":  401,
-				"message": "Unauthorized",
+			c.JSON(403, gin.H{
+				"status":  403,
+				"message": "Forbidden",
 			})
 			return
 		}
@@ -157,44 +157,41 @@ func (controller *ProxyController) proxyHandler(c *gin.Context) {
 		return
 	}
 
-	var userContext config.UserContext
-
-	context, err := utils.GetContext(c)
+	userContext, err := new(model.UserContext).NewFromGin(c)
 
 	if err != nil {
-		tlog.App.Debug().Msg("No user context found in request, treating as not logged in")
-		userContext = config.UserContext{
-			IsLoggedIn: false,
+		// No user context found is not an issue
+		if !errors.Is(err, model.ErrUserContextNotFound) {
+			controller.log.App.Error().Err(err).Msg("Failed to create user context from request, treating as unauthenticated")
 		}
-	} else {
-		userContext = context
+		userContext = &model.UserContext{
+			Authenticated: false,
+		}
 	}
 
-	tlog.App.Trace().Interface("context", userContext).Msg("User context from request")
+	aclsCtx.UserContext = userContext
 
-	if userContext.IsLoggedIn {
-		userAllowed := controller.auth.IsUserAllowed(c, userContext, acls)
+	if userContext.Authenticated {
+		if !controller.policyEngine.Evaluate(service.RuleUserAllowed, aclsCtx) {
+			controller.log.App.Warn().Str("user", userContext.GetUsername()).Str("resource", strings.Split(proxyCtx.Host, ".")[0]).Msg("User is not allowed to access resource")
 
-		if !userAllowed {
-			tlog.App.Warn().Str("user", userContext.Username).Str("resource", strings.Split(proxyCtx.Host, ".")[0]).Msg("User not allowed to access resource")
-
-			queries, err := query.Values(config.UnauthorizedQuery{
+			queries, err := query.Values(UnauthorizedQuery{
 				Resource: strings.Split(proxyCtx.Host, ".")[0],
 			})
 
 			if err != nil {
-				tlog.App.Error().Err(err).Msg("Failed to encode unauthorized query")
+				controller.log.App.Error().Err(err).Msg("Failed to encode unauthorized query")
 				controller.handleError(c, proxyCtx)
 				return
 			}
 
-			if userContext.OAuth {
-				queries.Set("username", userContext.Email)
+			if userContext.IsOAuth() {
+				queries.Set("username", userContext.GetEmail())
 			} else {
-				queries.Set("username", userContext.Username)
+				queries.Set("username", userContext.GetUsername())
 			}
 
-			redirectURL := fmt.Sprintf("%s/unauthorized?%s", controller.config.AppURL, queries.Encode())
+			redirectURL := fmt.Sprintf("%s/unauthorized?%s", controller.runtime.AppURL, queries.Encode())
 
 			if !controller.useBrowserResponse(proxyCtx) {
 				c.Header("x-tinyauth-location", redirectURL)
@@ -209,36 +206,36 @@ func (controller *ProxyController) proxyHandler(c *gin.Context) {
 			return
 		}
 
-		if userContext.OAuth || userContext.Provider == "ldap" {
+		if userContext.IsOAuth() || userContext.IsLDAP() {
 			var groupOK bool
 
-			if userContext.OAuth {
-				groupOK = controller.auth.IsInOAuthGroup(c, userContext, acls.OAuth.Groups)
+			if userContext.IsOAuth() {
+				groupOK = controller.policyEngine.Evaluate(service.RuleOAuthGroup, aclsCtx)
 			} else {
-				groupOK = controller.auth.IsInLdapGroup(c, userContext, acls.LDAP.Groups)
+				groupOK = controller.policyEngine.Evaluate(service.RuleLDAPGroup, aclsCtx)
 			}
 
 			if !groupOK {
-				tlog.App.Warn().Str("user", userContext.Username).Str("resource", strings.Split(proxyCtx.Host, ".")[0]).Msg("User groups do not match resource requirements")
+				controller.log.App.Warn().Str("user", userContext.GetUsername()).Str("resource", strings.Split(proxyCtx.Host, ".")[0]).Msg("User is not in the required group to access resource")
 
-				queries, err := query.Values(config.UnauthorizedQuery{
+				queries, err := query.Values(UnauthorizedQuery{
 					Resource: strings.Split(proxyCtx.Host, ".")[0],
 					GroupErr: true,
 				})
 
 				if err != nil {
-					tlog.App.Error().Err(err).Msg("Failed to encode unauthorized query")
+					controller.log.App.Error().Err(err).Msg("Failed to encode unauthorized query")
 					controller.handleError(c, proxyCtx)
 					return
 				}
 
-				if userContext.OAuth {
-					queries.Set("username", userContext.Email)
+				if userContext.IsOAuth() {
+					queries.Set("username", userContext.GetEmail())
 				} else {
-					queries.Set("username", userContext.Username)
+					queries.Set("username", userContext.GetUsername())
 				}
 
-				redirectURL := fmt.Sprintf("%s/unauthorized?%s", controller.config.AppURL, queries.Encode())
+				redirectURL := fmt.Sprintf("%s/unauthorized?%s", controller.runtime.AppURL, queries.Encode())
 
 				if !controller.useBrowserResponse(proxyCtx) {
 					c.Header("x-tinyauth-location", redirectURL)
@@ -254,17 +251,18 @@ func (controller *ProxyController) proxyHandler(c *gin.Context) {
 			}
 		}
 
-		c.Header("Remote-User", utils.SanitizeHeader(userContext.Username))
-		c.Header("Remote-Name", utils.SanitizeHeader(userContext.Name))
-		c.Header("Remote-Email", utils.SanitizeHeader(userContext.Email))
+		c.Header("Remote-User", utils.SanitizeHeader(userContext.GetUsername()))
+		c.Header("Remote-Name", utils.SanitizeHeader(userContext.GetName()))
+		c.Header("Remote-Email", utils.SanitizeHeader(userContext.GetEmail()))
 
-		if userContext.Provider == "ldap" {
-			c.Header("Remote-Groups", utils.SanitizeHeader(userContext.LdapGroups))
-		} else if userContext.Provider != "local" {
-			c.Header("Remote-Groups", utils.SanitizeHeader(userContext.OAuthGroups))
+		if userContext.IsLDAP() {
+			c.Header("Remote-Groups", utils.SanitizeHeader(strings.Join(userContext.LDAP.Groups, ",")))
 		}
 
-		c.Header("Remote-Sub", utils.SanitizeHeader(userContext.OAuthSub))
+		if userContext.IsOAuth() {
+			c.Header("Remote-Groups", utils.SanitizeHeader(strings.Join(userContext.OAuth.Groups, ",")))
+			c.Header("Remote-Sub", utils.SanitizeHeader(userContext.OAuth.Sub))
+		}
 
 		controller.setHeaders(c, acls)
 
@@ -275,17 +273,17 @@ func (controller *ProxyController) proxyHandler(c *gin.Context) {
 		return
 	}
 
-	queries, err := query.Values(config.RedirectQuery{
+	queries, err := query.Values(RedirectQuery{
 		RedirectURI: fmt.Sprintf("%s://%s%s", proxyCtx.Proto, proxyCtx.Host, proxyCtx.Path),
 	})
 
 	if err != nil {
-		tlog.App.Error().Err(err).Msg("Failed to encode redirect URI query")
+		controller.log.App.Error().Err(err).Msg("Failed to encode redirect query")
 		controller.handleError(c, proxyCtx)
 		return
 	}
 
-	redirectURL := fmt.Sprintf("%s/login?%s", controller.config.AppURL, queries.Encode())
+	redirectURL := fmt.Sprintf("%s/login?%s", controller.runtime.AppURL, queries.Encode())
 
 	if !controller.useBrowserResponse(proxyCtx) {
 		c.Header("x-tinyauth-location", redirectURL)
@@ -299,26 +297,29 @@ func (controller *ProxyController) proxyHandler(c *gin.Context) {
 	c.Redirect(http.StatusTemporaryRedirect, redirectURL)
 }
 
-func (controller *ProxyController) setHeaders(c *gin.Context, acls config.App) {
+func (controller *ProxyController) setHeaders(c *gin.Context, acls *model.App) {
 	c.Header("Authorization", c.Request.Header.Get("Authorization"))
+
+	if acls == nil {
+		return
+	}
 
 	headers := utils.ParseHeaders(acls.Response.Headers)
 
 	for key, value := range headers {
-		tlog.App.Debug().Str("header", key).Msg("Setting header")
 		c.Header(key, value)
 	}
 
 	basicPassword := utils.GetSecret(acls.Response.BasicAuth.Password, acls.Response.BasicAuth.PasswordFile)
 
 	if acls.Response.BasicAuth.Username != "" && basicPassword != "" {
-		tlog.App.Debug().Str("username", acls.Response.BasicAuth.Username).Msg("Setting basic auth header")
-		c.Header("Authorization", fmt.Sprintf("Basic %s", utils.GetBasicAuth(acls.Response.BasicAuth.Username, basicPassword)))
+		controller.log.App.Debug().Msg("Setting basic auth header for response")
+		c.Header("Authorization", fmt.Sprintf("Basic %s", utils.EncodeBasicAuth(acls.Response.BasicAuth.Username, basicPassword)))
 	}
 }
 
 func (controller *ProxyController) handleError(c *gin.Context, proxyCtx ProxyContext) {
-	redirectURL := fmt.Sprintf("%s/error", controller.config.AppURL)
+	redirectURL := fmt.Sprintf("%s/error", controller.runtime.AppURL)
 
 	if !controller.useBrowserResponse(proxyCtx) {
 		c.Header("x-tinyauth-location", redirectURL)
@@ -519,7 +520,7 @@ func (controller *ProxyController) getProxyContext(c *gin.Context) (ProxyContext
 		return ProxyContext{}, err
 	}
 
-	tlog.App.Debug().Msgf("Proxy: %v", req.Proxy)
+	controller.log.App.Debug().Msgf("Determined proxy type: %v", proxy)
 
 	authModules := controller.determineAuthModules(proxy)
 
@@ -530,13 +531,13 @@ func (controller *ProxyController) getProxyContext(c *gin.Context) (ProxyContext
 	var ctx ProxyContext
 
 	for _, module := range authModules {
-		tlog.App.Debug().Msgf("Trying auth module: %v", module)
+		controller.log.App.Debug().Msgf("Trying to get context from auth module %v", module)
 		ctx, err = controller.getContextFromAuthModule(c, module)
 		if err == nil {
-			tlog.App.Debug().Msgf("Auth module %v succeeded", module)
+			controller.log.App.Debug().Msgf("Successfully got context from auth module %v", module)
 			break
 		}
-		tlog.App.Debug().Err(err).Msgf("Auth module %v failed", module)
+		controller.log.App.Debug().Msgf("Failed to get context from auth module %v: %v", module, err)
 	}
 
 	if err != nil {
@@ -548,9 +549,9 @@ func (controller *ProxyController) getProxyContext(c *gin.Context) (ProxyContext
 	isBrowser := BrowserUserAgentRegex.MatchString(userAgent)
 
 	if isBrowser {
-		tlog.App.Debug().Msg("Request identified as coming from a browser")
+		controller.log.App.Debug().Msg("Request identified as coming from a browser client")
 	} else {
-		tlog.App.Debug().Msg("Request identified as coming from a non-browser client")
+		controller.log.App.Debug().Msg("Request identified as coming from a non-browser client")
 	}
 
 	ctx.IsBrowser = isBrowser

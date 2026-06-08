@@ -1,22 +1,33 @@
 package bootstrap
 
 import (
+	"context"
+	"errors"
 	"fmt"
-	"slices"
+	"net"
+	"net/http"
+	"os"
+	"time"
 
-	"github.com/tinyauthapp/tinyauth/internal/config"
+	"github.com/steveiliop56/ding"
 	"github.com/tinyauthapp/tinyauth/internal/controller"
 	"github.com/tinyauthapp/tinyauth/internal/middleware"
+	"github.com/tinyauthapp/tinyauth/internal/model"
 
 	"github.com/gin-gonic/gin"
 )
 
-var DEV_MODES = []string{"main", "test", "development"}
+type Listener int
 
-func (app *BootstrapApp) setupRouter() (*gin.Engine, error) {
-	if !slices.Contains(DEV_MODES, config.Version) {
-		gin.SetMode(gin.ReleaseMode)
-	}
+const (
+	ListenerHTTP Listener = iota
+	ListenerUnix
+	ListenerTailscale
+)
+
+func (app *BootstrapApp) setupRouter() error {
+	// we don't want gin debug mode
+	gin.SetMode(gin.ReleaseMode)
 
 	engine := gin.New()
 	engine.Use(gin.Recovery())
@@ -25,98 +36,195 @@ func (app *BootstrapApp) setupRouter() (*gin.Engine, error) {
 		err := engine.SetTrustedProxies(app.config.Auth.TrustedProxies)
 
 		if err != nil {
-			return nil, fmt.Errorf("failed to set trusted proxies: %w", err)
+			return fmt.Errorf("failed to set trusted proxies: %w", err)
 		}
 	}
 
-	contextMiddleware := middleware.NewContextMiddleware(middleware.ContextMiddlewareConfig{
-		CookieDomain: app.context.cookieDomain,
-	}, app.services.authService, app.services.oauthBrokerService)
-
-	err := contextMiddleware.Init()
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize context middleware: %w", err)
-	}
-
+	contextMiddleware := middleware.NewContextMiddleware(app.log, app.runtime, app.services.authService, app.services.oauthBrokerService, app.services.tailscaleService)
 	engine.Use(contextMiddleware.Middleware())
 
-	uiMiddleware := middleware.NewUIMiddleware()
-
-	err = uiMiddleware.Init()
+	uiMiddleware, err := middleware.NewUIMiddleware()
 
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize UI middleware: %w", err)
+		return fmt.Errorf("failed to initialize UI middleware: %w", err)
 	}
 
 	engine.Use(uiMiddleware.Middleware())
 
-	zerologMiddleware := middleware.NewZerologMiddleware()
-
-	err = zerologMiddleware.Init()
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize zerolog middleware: %w", err)
-	}
+	zerologMiddleware := middleware.NewZerologMiddleware(app.log)
 
 	engine.Use(zerologMiddleware.Middleware())
 
 	apiRouter := engine.Group("/api")
 
-	contextController := controller.NewContextController(controller.ContextControllerConfig{
-		Providers:             app.context.configuredProviders,
-		Title:                 app.config.UI.Title,
-		AppURL:                app.config.AppURL,
-		CookieDomain:          app.context.cookieDomain,
-		ForgotPasswordMessage: app.config.UI.ForgotPasswordMessage,
-		BackgroundImage:       app.config.UI.BackgroundImage,
-		OAuthAutoRedirect:     app.config.OAuth.AutoRedirect,
-		WarningsEnabled:       app.config.UI.WarningsEnabled,
-	}, apiRouter)
+	controller.NewContextController(app.log, app.config, app.runtime, apiRouter)
+	controller.NewOAuthController(app.log, app.config, app.runtime, apiRouter, app.services.authService)
+	controller.NewOIDCController(app.log, app.services.oidcService, app.runtime, apiRouter)
+	controller.NewProxyController(app.log, app.runtime, apiRouter, app.services.accessControlService, app.services.authService, app.services.policyEngine)
+	controller.NewUserController(app.log, app.runtime, apiRouter, app.services.authService)
+	controller.NewResourcesController(app.config, &engine.RouterGroup)
+	controller.NewHealthController(apiRouter)
+	controller.NewWellKnownController(app.services.oidcService, &engine.RouterGroup)
 
-	contextController.SetupRoutes()
+	app.router = engine
+	return nil
+}
 
-	oauthController := controller.NewOAuthController(controller.OAuthControllerConfig{
-		AppURL:                 app.config.AppURL,
-		SecureCookie:           app.config.Auth.SecureCookie,
-		CSRFCookieName:         app.context.csrfCookieName,
-		RedirectCookieName:     app.context.redirectCookieName,
-		CookieDomain:           app.context.cookieDomain,
-		OAuthSessionCookieName: app.context.oauthSessionCookieName,
-	}, apiRouter, app.services.authService)
+func (app *BootstrapApp) runListeners() (chan error, error) {
+	// lec -> listener error channel
+	lec := make(chan error, len(app.listeners))
 
-	oauthController.SetupRoutes()
+	for _, listenerType := range app.listeners {
+		listenerFunc, err := app.listenerFromType(listenerType)
 
-	oidcController := controller.NewOIDCController(controller.OIDCControllerConfig{}, app.services.oidcService, apiRouter)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get listener function: %w", err)
+		}
 
-	oidcController.SetupRoutes()
+		app.ding.Go(func(ctx context.Context) {
+			lec <- listenerFunc(ctx)
+		}, ding.RingNormal)
+	}
 
-	proxyController := controller.NewProxyController(controller.ProxyControllerConfig{
-		AppURL: app.config.AppURL,
-	}, apiRouter, app.services.accessControlService, app.services.authService)
+	return lec, nil
+}
 
-	proxyController.SetupRoutes()
+// The way we calculate listeners is as follows:
+// If concurrent listeners are disabled, we pick the first available listener, so:
+// 1. If tailscale is enabled, we use tailscale
+// 2. If socket path is configured, we use unix socket
+// 3. Finally if none is configured we use http
+// If concurrent listeners are enabled, we add all available listeners in the following order
+func (app *BootstrapApp) calculateListenerPolicy() []Listener {
+	l := []Listener{}
 
-	userController := controller.NewUserController(controller.UserControllerConfig{
-		CookieDomain: app.context.cookieDomain,
-	}, apiRouter, app.services.authService)
+	if !app.config.Server.ConcurrentListenersEnabled {
+		if app.services.tailscaleService != nil {
+			l = append(l, ListenerTailscale)
+			return l
+		}
 
-	userController.SetupRoutes()
+		if app.config.Server.SocketPath != "" {
+			l = append(l, ListenerUnix)
+			return l
+		}
 
-	resourcesController := controller.NewResourcesController(controller.ResourcesControllerConfig{
-		Path:    app.config.Resources.Path,
-		Enabled: app.config.Resources.Enabled,
-	}, &engine.RouterGroup)
+		l = append(l, ListenerHTTP)
+		return l
+	}
 
-	resourcesController.SetupRoutes()
+	if app.config.Server.SocketPath != "" {
+		l = append(l, ListenerUnix)
+	}
 
-	healthController := controller.NewHealthController(apiRouter)
+	if app.services.tailscaleService != nil {
+		l = append(l, ListenerTailscale)
+	}
 
-	healthController.SetupRoutes()
+	l = append(l, ListenerHTTP)
 
-	wellknownController := controller.NewWellKnownController(controller.WellKnownControllerConfig{}, app.services.oidcService, engine)
+	return l
+}
 
-	wellknownController.SetupRoutes()
+func (app *BootstrapApp) listenerFromType(listenerType Listener) (func(ctx context.Context) error, error) {
+	switch listenerType {
+	case ListenerHTTP:
+		return app.serveHTTP, nil
+	case ListenerUnix:
+		return app.serveUnix, nil
+	case ListenerTailscale:
+		return app.serveTailscale, nil
+	default:
+		return nil, fmt.Errorf("invalid listener type: %d", listenerType)
+	}
+}
 
-	return engine, nil
+func (app *BootstrapApp) serveHTTP(ctx context.Context) error {
+	address := fmt.Sprintf("%s:%d", app.config.Server.Address, app.config.Server.Port)
+
+	app.log.App.Info().Msgf("Starting server on %s", address)
+
+	listener, err := net.Listen("tcp", address)
+
+	if err != nil {
+		return fmt.Errorf("failed to create tcp listener: %w", err)
+	}
+
+	server := &http.Server{
+		Addr:    address,
+		Handler: app.router.Handler(),
+	}
+
+	return app.serve(listener, server, ctx, "http")
+}
+
+func (app *BootstrapApp) serveUnix(ctx context.Context) error {
+	_, err := os.Stat(app.config.Server.SocketPath)
+
+	if err == nil {
+		app.log.App.Info().Msgf("Removing existing socket file %s", app.config.Server.SocketPath)
+		err := os.Remove(app.config.Server.SocketPath)
+
+		if err != nil {
+			return fmt.Errorf("failed to remove existing socket file: %w", err)
+		}
+	}
+
+	app.log.App.Info().Msgf("Starting server on unix socket %s", app.config.Server.SocketPath)
+
+	listener, err := net.Listen("unix", app.config.Server.SocketPath)
+
+	if err != nil {
+		return fmt.Errorf("failed to create unix socket listener: %w", err)
+	}
+
+	server := &http.Server{
+		Handler: app.router.Handler(),
+	}
+
+	return app.serve(listener, server, ctx, "unix socket")
+}
+
+func (app *BootstrapApp) serveTailscale(ctx context.Context) error {
+	app.log.App.Info().Msgf("Starting Tailscale server on %s", fmt.Sprintf("https://%s", app.services.tailscaleService.GetHostname()))
+
+	listener, err := app.services.tailscaleService.CreateListener()
+
+	if err != nil {
+		return fmt.Errorf("failed to create tailscale listener: %w", err)
+	}
+
+	server := &http.Server{
+		Handler: app.router.Handler(),
+	}
+
+	return app.serve(listener, server, ctx, "tailscale")
+}
+
+func (app *BootstrapApp) serve(listener net.Listener, server *http.Server, ctx context.Context, name string) error {
+	shutdown := func() {
+		// we use a new context for the shutdown since the main one is cancelled
+		sctx, cancel := context.WithTimeout(context.Background(), model.GracefulShutdownTimeout*time.Second)
+		defer cancel()
+		err := server.Shutdown(sctx)
+		if err != nil {
+			app.log.App.Error().Err(err).Msgf("Failed to shutdown %s listener gracefully", name)
+		}
+		listener.Close()
+	}
+
+	go func() {
+		<-ctx.Done()
+		app.log.App.Debug().Msgf("Shutting down %s listener", name)
+		shutdown()
+	}()
+
+	err := server.Serve(listener)
+
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
+		shutdown()
+		return fmt.Errorf("failed to start %s listener: %w", name, err)
+	}
+
+	return nil
 }

@@ -8,6 +8,7 @@ TAG_NAME := $(shell git describe --abbrev=0 --exact-match 2> /dev/null || echo "
 COMMIT_HASH := $(shell git rev-parse HEAD)
 BUILD_TIMESTAMP := $(shell date '+%Y-%m-%dT%H:%M:%S')
 BIN_NAME := tinyauth-$(GOARCH)
+LDFLAGS := -s -w
 
 # Development vars
 DEV_COMPOSE := $(shell test -f "docker-compose.test.yml" && echo "docker-compose.test.yml" || echo "docker-compose.dev.yml" )
@@ -17,7 +18,7 @@ PROD_COMPOSE := $(shell test -f "docker-compose.test.prod.yml" && echo "docker-c
 
 # Deps
 deps:
-	bun install --frozen-lockfile --cwd frontend
+	cd frontend && pnpm ci
 	go mod download
 
 # Clean data
@@ -31,15 +32,15 @@ clean-webui:
 
 # Build the web UI
 webui: clean-webui
-	bun run --cwd frontend build
+	cd frontend && pnpm run build
 	cp -r frontend/dist internal/assets
 
 # Build the binary
 binary: webui
-	CGO_ENABLED=$(CGO_ENABLED) go build -ldflags "-s -w \
-	-X github.com/tinyauthapp/tinyauth/internal/config.Version=${TAG_NAME} \
-	-X github.com/tinyauthapp/tinyauth/internal/config.CommitHash=${COMMIT_HASH} \
-	-X github.com/tinyauthapp/tinyauth/internal/config.BuildTimestamp=${BUILD_TIMESTAMP}" \
+	CGO_ENABLED=$(CGO_ENABLED) go build -ldflags "${LDFLAGS} \
+	-X github.com/tinyauthapp/tinyauth/internal/model.Version=${TAG_NAME} \
+	-X github.com/tinyauthapp/tinyauth/internal/model.CommitHash=${COMMIT_HASH} \
+	-X github.com/tinyauthapp/tinyauth/internal/model.BuildTimestamp=${BUILD_TIMESTAMP}" \
 	-o ${BIN_NAME} ./cmd/tinyauth
 
 # Build for amd64
@@ -60,6 +61,15 @@ binary-linux-arm64:
 .PHONY: test
 test:
 	go test -v ./...
+
+# Go vet
+.PHONY: vet
+vet:
+	go vet ./...
+
+# Go race
+test-race:
+	go test -race ./...
 
 # Development
 dev:
@@ -85,3 +95,4 @@ sql:
 # Go gen
 generate:
 	go run ./gen
+	go generate ./internal/repository/...

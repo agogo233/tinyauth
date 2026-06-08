@@ -3,14 +3,18 @@ package service
 import (
 	"testing"
 
-	"github.com/tinyauthapp/tinyauth/internal/config"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tinyauthapp/tinyauth/internal/model"
+	"github.com/tinyauthapp/tinyauth/internal/utils/logger"
 )
 
 func TestKubernetesService(t *testing.T) {
+	log := logger.NewLogger().WithTestConfig()
+	log.Init()
+
 	type testCase struct {
 		description string
 		run         func(t *testing.T, svc *KubernetesService)
@@ -20,69 +24,69 @@ func TestKubernetesService(t *testing.T) {
 		{
 			description: "Cache by domain returns app and misses unknown domain",
 			run: func(t *testing.T, svc *KubernetesService) {
-				app := config.App{Config: config.AppConfig{Domain: "foo.example.com"}}
+				app := model.App{Config: model.AppConfig{Domain: "foo.example.com"}}
 				svc.addIngressApps("default", "my-ingress", []ingressApp{
 					{domain: "foo.example.com", appName: "foo", app: app},
 				})
 
-				got, ok := svc.getByDomain("foo.example.com")
-				require.True(t, ok)
+				got := svc.getByDomain("foo.example.com")
+				require.NotNil(t, got)
 				assert.Equal(t, "foo.example.com", got.Config.Domain)
 
-				_, ok = svc.getByDomain("notfound.example.com")
-				assert.False(t, ok)
+				got = svc.getByDomain("notfound.example.com")
+				assert.Nil(t, got)
 			},
 		},
 		{
 			description: "Cache by app name returns app and misses unknown name",
 			run: func(t *testing.T, svc *KubernetesService) {
-				app := config.App{Config: config.AppConfig{Domain: "bar.example.com"}}
+				app := model.App{Config: model.AppConfig{Domain: "bar.example.com"}}
 				svc.addIngressApps("default", "my-ingress", []ingressApp{
 					{domain: "bar.example.com", appName: "bar", app: app},
 				})
 
-				got, ok := svc.getByAppName("bar")
-				require.True(t, ok)
+				got := svc.getByAppName("bar")
+				require.NotNil(t, got)
 				assert.Equal(t, "bar.example.com", got.Config.Domain)
 
-				_, ok = svc.getByAppName("notfound")
-				assert.False(t, ok)
+				got = svc.getByAppName("notfound")
+				assert.Nil(t, got)
 			},
 		},
 		{
 			description: "RemoveIngress clears domain and app name entries",
 			run: func(t *testing.T, svc *KubernetesService) {
-				app := config.App{Config: config.AppConfig{Domain: "baz.example.com"}}
+				app := model.App{Config: model.AppConfig{Domain: "baz.example.com"}}
 				svc.addIngressApps("default", "my-ingress", []ingressApp{
 					{domain: "baz.example.com", appName: "baz", app: app},
 				})
 
 				svc.removeIngress("default", "my-ingress")
 
-				_, ok := svc.getByDomain("baz.example.com")
-				assert.False(t, ok)
-				_, ok = svc.getByAppName("baz")
-				assert.False(t, ok)
+				got := svc.getByDomain("baz.example.com")
+				assert.Nil(t, got)
+				got = svc.getByAppName("baz")
+				assert.Nil(t, got)
 			},
 		},
 		{
 			description: "AddIngressApps replaces stale entries for the same ingress",
 			run: func(t *testing.T, svc *KubernetesService) {
-				old := config.App{Config: config.AppConfig{Domain: "old.example.com"}}
+				old := model.App{Config: model.AppConfig{Domain: "old.example.com"}}
 				svc.addIngressApps("default", "my-ingress", []ingressApp{
 					{domain: "old.example.com", appName: "old", app: old},
 				})
 
-				updated := config.App{Config: config.AppConfig{Domain: "new.example.com"}}
+				updated := model.App{Config: model.AppConfig{Domain: "new.example.com"}}
 				svc.addIngressApps("default", "my-ingress", []ingressApp{
 					{domain: "new.example.com", appName: "new", app: updated},
 				})
 
-				_, ok := svc.getByDomain("old.example.com")
-				assert.False(t, ok)
+				got := svc.getByDomain("old.example.com")
+				assert.Nil(t, got)
 
-				got, ok := svc.getByDomain("new.example.com")
-				require.True(t, ok)
+				got = svc.getByDomain("new.example.com")
+				require.NotNil(t, got)
 				assert.Equal(t, "new.example.com", got.Config.Domain)
 			},
 		},
@@ -91,7 +95,7 @@ func TestKubernetesService(t *testing.T) {
 			run: func(t *testing.T, svc *KubernetesService) {
 				svc.started = true
 
-				app := config.App{Config: config.AppConfig{Domain: "hit.example.com"}}
+				app := model.App{Config: model.AppConfig{Domain: "hit.example.com"}}
 				svc.addIngressApps("default", "ing", []ingressApp{
 					{domain: "hit.example.com", appName: "hit", app: app},
 				})
@@ -108,7 +112,7 @@ func TestKubernetesService(t *testing.T) {
 
 				got, err := svc.GetLabels("notfound.example.com")
 				require.NoError(t, err)
-				assert.Equal(t, config.App{}, got)
+				assert.Nil(t, got)
 			},
 		},
 		{
@@ -116,7 +120,7 @@ func TestKubernetesService(t *testing.T) {
 			run: func(t *testing.T, svc *KubernetesService) {
 				svc.started = true
 
-				app := config.App{Config: config.AppConfig{Domain: "myapp.internal.example.com"}}
+				app := model.App{Config: model.AppConfig{Domain: "myapp.internal.example.com"}}
 				svc.addIngressApps("default", "ing", []ingressApp{
 					{domain: "myapp.internal.example.com", appName: "myapp", app: app},
 				})
@@ -131,7 +135,7 @@ func TestKubernetesService(t *testing.T) {
 			run: func(t *testing.T, svc *KubernetesService) {
 				got, err := svc.GetLabels("anything.example.com")
 				require.NoError(t, err)
-				assert.Equal(t, config.App{}, got)
+				assert.Nil(t, got)
 			},
 		},
 		{
@@ -147,8 +151,8 @@ func TestKubernetesService(t *testing.T) {
 
 				svc.updateFromItem(&item)
 
-				got, ok := svc.getByDomain("myapp.example.com")
-				require.True(t, ok)
+				got := svc.getByDomain("myapp.example.com")
+				require.NotNil(t, got)
 				assert.Equal(t, "myapp.example.com", got.Config.Domain)
 				assert.Equal(t, "alice", got.Users.Allow)
 			},
@@ -156,7 +160,7 @@ func TestKubernetesService(t *testing.T) {
 		{
 			description: "UpdateFromItem with no annotations removes existing cache entries",
 			run: func(t *testing.T, svc *KubernetesService) {
-				app := config.App{Config: config.AppConfig{Domain: "todelete.example.com"}}
+				app := model.App{Config: model.AppConfig{Domain: "todelete.example.com"}}
 				svc.addIngressApps("default", "test-ingress", []ingressApp{
 					{domain: "todelete.example.com", appName: "todelete", app: app},
 				})
@@ -167,8 +171,8 @@ func TestKubernetesService(t *testing.T) {
 
 				svc.updateFromItem(&item)
 
-				_, ok := svc.getByDomain("todelete.example.com")
-				assert.False(t, ok)
+				got := svc.getByDomain("todelete.example.com")
+				assert.Nil(t, got)
 			},
 		},
 	}
@@ -179,6 +183,7 @@ func TestKubernetesService(t *testing.T) {
 				ingressApps:  make(map[ingressKey][]ingressApp),
 				domainIndex:  make(map[string]ingressAppKey),
 				appNameIndex: make(map[string]ingressAppKey),
+				log:          log,
 			}
 			test.run(t, svc)
 		})

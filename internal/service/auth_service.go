@@ -2,22 +2,19 @@ package service
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
-	"regexp"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/tinyauthapp/tinyauth/internal/config"
+	"github.com/steveiliop56/ding"
+	"github.com/tinyauthapp/tinyauth/internal/model"
 	"github.com/tinyauthapp/tinyauth/internal/repository"
 	"github.com/tinyauthapp/tinyauth/internal/utils"
-	"github.com/tinyauthapp/tinyauth/internal/utils/tlog"
+	"github.com/tinyauthapp/tinyauth/internal/utils/logger"
 
-	"slices"
-
-	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/oauth2"
@@ -28,6 +25,10 @@ import (
 const MaxOAuthPendingSessions = 256
 const OAuthCleanupCount = 16
 const MaxLoginAttemptRecords = 256
+
+var (
+	ErrUserNotFound = errors.New("user not found")
+)
 
 // slightly modified version of the AuthorizeRequest from the OIDC service to basically accept all
 // parameters and pass them to the authorize page if needed
@@ -51,192 +52,194 @@ type OAuthPendingSession struct {
 	CallbackParams OAuthURLParams
 }
 
-type LdapGroupsCache struct {
-	Groups  []string
-	Expires time.Time
-}
-
 type LoginAttempt struct {
 	FailedAttempts int
 	LastAttempt    time.Time
 	LockedUntil    time.Time
 }
 
-type Lockdown struct {
-	Active      bool
-	ActiveUntil time.Time
-}
-
-type AuthServiceConfig struct {
-	Users              []config.User
-	OauthWhitelist     []string
-	SessionExpiry      int
-	SessionMaxLifetime int
-	SecureCookie       bool
-	CookieDomain       string
-	LoginTimeout       int
-	LoginMaxRetries    int
-	SessionCookieName  string
-	IP                 config.IPConfig
-	LDAPGroupsCacheTTL int
-}
-
 type AuthService struct {
-	config               AuthServiceConfig
-	loginAttempts        map[string]*LoginAttempt
-	ldapGroupsCache      map[string]*LdapGroupsCache
-	oauthPendingSessions map[string]*OAuthPendingSession
-	oauthMutex           sync.RWMutex
-	loginMutex           sync.RWMutex
-	ldapGroupsMutex      sync.RWMutex
-	ldap                 *LdapService
-	queries              *repository.Queries
-	oauthBroker          *OAuthBrokerService
-	lockdown             *Lockdown
-	lockdownCtx          context.Context
-	lockdownCancelFunc   context.CancelFunc
-}
+	log     *logger.Logger
+	config  model.Config
+	runtime model.RuntimeConfig
+	ctx     context.Context
 
-func NewAuthService(config AuthServiceConfig, ldap *LdapService, queries *repository.Queries, oauthBroker *OAuthBrokerService) *AuthService {
-	return &AuthService{
-		config:               config,
-		loginAttempts:        make(map[string]*LoginAttempt),
-		ldapGroupsCache:      make(map[string]*LdapGroupsCache),
-		oauthPendingSessions: make(map[string]*OAuthPendingSession),
-		ldap:                 ldap,
-		queries:              queries,
-		oauthBroker:          oauthBroker,
-}
-}
+	ldap         *LdapService
+	queries      repository.Store
+	oauthBroker  *OAuthBrokerService
+	tailscale    *TailscaleService
+	policyEngine *PolicyEngine
 
-func (auth *AuthService) Init() error {
-	go auth.CleanupOAuthSessionsRoutine()
-	return nil
-}
-
-func (auth *AuthService) SearchUser(username string) config.UserSearch {
-	if auth.GetLocalUser(username).Username != "" {
-		return config.UserSearch{
-			Username: username,
-			Type:     "local",
-		}
+	lockdown struct {
+		active     bool
+		until      time.Time
+		ctx        context.Context
+		cancelFunc context.CancelFunc
+		mu         sync.RWMutex
 	}
 
-	if auth.ldap.IsConfigured() {
-		userDN, err := auth.ldap.GetUserDN(username)
+	caches struct {
+		login *CacheStore[LoginAttempt]
+		oauth *CacheStore[OAuthPendingSession]
+		ldap  *CacheStore[[]string]
+	}
+}
 
-		if err != nil {
-			tlog.App.Warn().Err(err).Str("username", username).Msg("Failed to search for user in LDAP")
-			return config.UserSearch{
-				Type: "unknown",
+func NewAuthService(
+	log *logger.Logger,
+	config model.Config,
+	runtime model.RuntimeConfig,
+	ctx context.Context,
+	dg *ding.Ding,
+	ldap *LdapService,
+	queries repository.Store,
+	oauthBroker *OAuthBrokerService,
+	tailscale *TailscaleService,
+	policy *PolicyEngine,
+) *AuthService {
+	service := &AuthService{
+		log:          log,
+		runtime:      runtime,
+		ctx:          ctx,
+		config:       config,
+		ldap:         ldap,
+		queries:      queries,
+		oauthBroker:  oauthBroker,
+		tailscale:    tailscale,
+		policyEngine: policy,
+	}
+
+	// caches setup
+	oauthCache := NewCacheStore[OAuthPendingSession](256)
+	loginCache := NewCacheStore[LoginAttempt](1024)
+	ldapCache := NewCacheStore[[]string](1024)
+
+	service.caches.oauth = oauthCache
+	service.caches.login = loginCache
+	service.caches.ldap = ldapCache
+
+	dg.Go(func(ctx context.Context) {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				service.caches.oauth.Sweep()
+				service.caches.login.Sweep()
+				service.caches.ldap.Sweep()
+			case <-ctx.Done():
+				return
 			}
 		}
+	}, ding.RingMinor)
 
-		return config.UserSearch{
-			Username: userDN,
-			Type:     "ldap",
-		}
-	}
-
-	return config.UserSearch{
-		Type: "unknown",
-	}
+	return service
 }
 
-func (auth *AuthService) VerifyUser(search config.UserSearch, password string) bool {
+func (auth *AuthService) SearchUser(username string) (*model.UserSearch, error) {
+	if auth.GetLocalUser(username) != nil {
+		return &model.UserSearch{
+			Username: username,
+			Type:     model.UserLocal,
+		}, nil
+	}
+
+	if auth.ldap != nil {
+		userDN, email, err := auth.ldap.GetUserInfo(username)
+
+		if err != nil {
+			return nil, fmt.Errorf("failed to get ldap user: %w", err)
+		}
+
+		return &model.UserSearch{
+			Username: userDN,
+			Email:    email,
+			Type:     model.UserLDAP,
+		}, nil
+	}
+
+	return nil, ErrUserNotFound
+}
+
+func (auth *AuthService) CheckUserPassword(search model.UserSearch, password string) error {
 	switch search.Type {
-	case "local":
+	case model.UserLocal:
 		user := auth.GetLocalUser(search.Username)
-		return auth.CheckPassword(user, password)
-	case "ldap":
-		if auth.ldap.IsConfigured() {
+		if user == nil {
+			return ErrUserNotFound
+		}
+		return bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(password))
+	case model.UserLDAP:
+		if auth.ldap != nil {
 			err := auth.ldap.Bind(search.Username, password)
 			if err != nil {
-				tlog.App.Warn().Err(err).Str("username", search.Username).Msg("Failed to bind to LDAP")
-				return false
+				return fmt.Errorf("failed to bind to ldap user: %w", err)
 			}
 
 			err = auth.ldap.BindService(true)
 			if err != nil {
-				tlog.App.Error().Err(err).Msg("Failed to rebind with service account after user authentication")
-				return false
+				return fmt.Errorf("failed to bind to ldap service account: %w", err)
 			}
 
-			return true
+			return nil
 		}
 	default:
-		tlog.App.Debug().Str("type", search.Type).Msg("Unknown user type for authentication")
-		return false
+		return errors.New("unknown user search type")
 	}
-
-	tlog.App.Warn().Str("username", search.Username).Msg("User authentication failed")
-	return false
+	return errors.New("user authentication failed")
 }
 
-func (auth *AuthService) GetLocalUser(username string) config.User {
-	for _, user := range auth.config.Users {
+func (auth *AuthService) GetLocalUser(username string) *model.LocalUser {
+	if auth.runtime.LocalUsers == nil {
+		return nil
+	}
+	for _, user := range auth.runtime.LocalUsers {
 		if user.Username == username {
-			return user
+			return &user
 		}
 	}
-
-	tlog.App.Warn().Str("username", username).Msg("Local user not found")
-	return config.User{}
+	return nil
 }
 
-func (auth *AuthService) GetLdapUser(userDN string) (config.LdapUser, error) {
-	if !auth.ldap.IsConfigured() {
-		return config.LdapUser{}, errors.New("LDAP service not initialized")
+func (auth *AuthService) GetLDAPUser(userDN string) (*model.LDAPUser, error) {
+	if auth.ldap == nil {
+		return nil, errors.New("ldap service not configured")
 	}
 
-	auth.ldapGroupsMutex.RLock()
-	entry, exists := auth.ldapGroupsCache[userDN]
-	auth.ldapGroupsMutex.RUnlock()
+	entry, exists := auth.caches.ldap.Get(userDN)
 
-	if exists && time.Now().Before(entry.Expires) {
-		return config.LdapUser{
+	if exists {
+		return &model.LDAPUser{
 			DN:     userDN,
-			Groups: entry.Groups,
+			Groups: entry,
 		}, nil
 	}
 
 	groups, err := auth.ldap.GetUserGroups(userDN)
 
 	if err != nil {
-		return config.LdapUser{}, err
+		return nil, fmt.Errorf("failed to get ldap groups: %w", err)
 	}
 
-	auth.ldapGroupsMutex.Lock()
-	auth.ldapGroupsCache[userDN] = &LdapGroupsCache{
-		Groups:  groups,
-		Expires: time.Now().Add(time.Duration(auth.config.LDAPGroupsCacheTTL) * time.Second),
-	}
-	auth.ldapGroupsMutex.Unlock()
+	auth.caches.ldap.Set(userDN, groups, time.Duration(auth.config.LDAP.GroupCacheTTL)*time.Second)
 
-	return config.LdapUser{
+	return &model.LDAPUser{
 		DN:     userDN,
 		Groups: groups,
 	}, nil
 }
 
-func (auth *AuthService) CheckPassword(user config.User, password string) bool {
-	return bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(password)) == nil
-}
-
 func (auth *AuthService) IsAccountLocked(identifier string) (bool, int) {
-	auth.loginMutex.RLock()
-	defer auth.loginMutex.RUnlock()
-
-	if auth.lockdown != nil && auth.lockdown.Active {
-		remaining := int(time.Until(auth.lockdown.ActiveUntil).Seconds())
+	if locked, remaining := auth.IsInLockdown(); locked {
 		return true, remaining
 	}
 
-	if auth.config.LoginMaxRetries <= 0 || auth.config.LoginTimeout <= 0 {
+	if auth.config.Auth.LoginMaxRetries <= 0 || auth.config.Auth.LoginTimeout <= 0 {
 		return false, 0
 	}
 
-	attempt, exists := auth.loginAttempts[identifier]
+	attempt, exists := auth.caches.login.Get(identifier)
 	if !exists {
 		return false, 0
 	}
@@ -250,52 +253,87 @@ func (auth *AuthService) IsAccountLocked(identifier string) (bool, int) {
 }
 
 func (auth *AuthService) RecordLoginAttempt(identifier string, success bool) {
-	if auth.config.LoginMaxRetries <= 0 || auth.config.LoginTimeout <= 0 {
+	if auth.config.Auth.LoginMaxRetries <= 0 || auth.config.Auth.LoginTimeout <= 0 {
 		return
 	}
 
-	auth.loginMutex.Lock()
-	defer auth.loginMutex.Unlock()
-
-	if len(auth.loginAttempts) >= MaxLoginAttemptRecords {
-		if auth.lockdown != nil && auth.lockdown.Active {
+	if auth.caches.login.Size() >= MaxLoginAttemptRecords {
+		if locked, _ := auth.IsInLockdown(); locked {
 			return
 		}
 		go auth.lockdownMode()
 		return
 	}
 
-	attempt, exists := auth.loginAttempts[identifier]
-	if !exists {
-		attempt = &LoginAttempt{}
-		auth.loginAttempts[identifier] = attempt
-	}
+	auth.caches.login.WithLock(func(actions CacheStoreActions[LoginAttempt]) {
+		entry, ok := actions.Get(identifier)
 
-	attempt.LastAttempt = time.Now()
+		if !ok {
+			attempt := LoginAttempt{
+				LastAttempt: time.Now(),
+			}
+			if !success {
+				attempt.FailedAttempts = 1
+				if attempt.FailedAttempts >= auth.config.Auth.LoginMaxRetries {
+					attempt.LockedUntil = time.Now().Add(time.Duration(auth.config.Auth.LoginTimeout) * time.Second)
+					auth.log.App.Warn().Str("identifier", identifier).Int("failedAttempts", attempt.FailedAttempts).Msg("Account locked due to too many failed login attempts")
+				}
+			}
+			// match current tinyauth behavior which doesn't expire rate limits
+			actions.Set(identifier, attempt, 0)
+			return
+		}
 
-	if success {
-		attempt.FailedAttempts = 0
-		attempt.LockedUntil = time.Time{} // Reset lock time
-		return
-	}
+		entry.LastAttempt = time.Now()
 
-	attempt.FailedAttempts++
+		if success {
+			entry.FailedAttempts = 0
+			entry.LockedUntil = time.Time{}
+		} else {
+			entry.FailedAttempts++
 
-	if attempt.FailedAttempts >= auth.config.LoginMaxRetries {
-		attempt.LockedUntil = time.Now().Add(time.Duration(auth.config.LoginTimeout) * time.Second)
-		tlog.App.Warn().Str("identifier", identifier).Int("timeout", auth.config.LoginTimeout).Msg("Account locked due to too many failed login attempts")
-	}
+			if entry.FailedAttempts >= auth.config.Auth.LoginMaxRetries {
+				entry.LockedUntil = time.Now().Add(time.Duration(auth.config.Auth.LoginTimeout) * time.Second)
+				auth.log.App.Warn().Str("identifier", identifier).Int("failedAttempts", entry.FailedAttempts).Msg("Account locked due to too many failed login attempts")
+			}
+		}
+
+		actions.Set(identifier, entry, 0)
+	})
 }
 
-func (auth *AuthService) IsEmailWhitelisted(email string) bool {
-	return utils.CheckFilter(strings.Join(auth.config.OauthWhitelist, ","), email)
+// We could also directly access the policyEngine.effectToAccess but
+// I believe it's better to use the exported functions instead
+func (auth *AuthService) IsEmailWhitelisted(provider string, email string) bool {
+	return auth.policyEngine.EvaluateFunc(func() Effect {
+		whitelist := auth.runtime.OAuthWhitelist
+		if providerConfig, ok := auth.runtime.OAuthProviders[provider]; ok && len(providerConfig.Whitelist) > 0 {
+			whitelist = providerConfig.Whitelist
+		}
+		match, err := utils.CheckFilter(strings.Join(whitelist, ","), email)
+		if err != nil {
+			if err == utils.ErrFilterEmpty {
+				return EffectAbstain
+			}
+			auth.log.App.Error().Err(err).Str("email", email).Msg("Failed to evaluate email whitelist filter, defaulting to deny")
+			return EffectDeny
+		}
+		if match {
+			return EffectAllow
+		}
+		return EffectDeny
+	})
 }
 
-func (auth *AuthService) CreateSessionCookie(c *gin.Context, data *repository.Session) error {
+func (auth *AuthService) CreateSession(ctx context.Context, data repository.Session) (*http.Cookie, error) {
+	if data.Provider == "tailscale" && auth.tailscale == nil {
+		return nil, fmt.Errorf("tailscale service not configured, cannot create session for tailscale user")
+	}
+
 	uuid, err := uuid.NewRandom()
 
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("failed to generate session uuid: %w", err)
 	}
 
 	var expiry int
@@ -303,8 +341,10 @@ func (auth *AuthService) CreateSessionCookie(c *gin.Context, data *repository.Se
 	if data.TotpPending {
 		expiry = 3600
 	} else {
-		expiry = auth.config.SessionExpiry
+		expiry = auth.config.Auth.SessionExpiry
 	}
+
+	expiresAt := time.Now().Add(time.Duration(expiry) * time.Second)
 
 	session := repository.CreateSessionParams{
 		UUID:        uuid.String(),
@@ -314,53 +354,77 @@ func (auth *AuthService) CreateSessionCookie(c *gin.Context, data *repository.Se
 		Provider:    data.Provider,
 		TotpPending: data.TotpPending,
 		OAuthGroups: data.OAuthGroups,
-		Expiry:      time.Now().Add(time.Duration(expiry) * time.Second).Unix(),
+		Expiry:      expiresAt.Unix(),
 		CreatedAt:   time.Now().Unix(),
 		OAuthName:   data.OAuthName,
 		OAuthSub:    data.OAuthSub,
 	}
 
-	_, err = auth.queries.CreateSession(c, session)
+	_, err = auth.queries.CreateSession(ctx, session)
 
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("failed to create session entry: %w", err)
 	}
 
-	c.SetCookie(auth.config.SessionCookieName, session.UUID, expiry, "/", fmt.Sprintf(".%s", auth.config.CookieDomain), auth.config.SecureCookie, true)
+	if data.Provider == "tailscale" {
+		auth.log.App.Trace().Str("url", fmt.Sprintf("https://%s", auth.tailscale.GetHostname())).Msg("Extracting root domain from Tailscale hostname")
 
-	return nil
+		tsCookieDomain, err := utils.GetCookieDomain(fmt.Sprintf("https://%s", auth.tailscale.GetHostname()))
+
+		if err != nil {
+			return nil, fmt.Errorf("failed to get cookie domain for tailscale user: %w", err)
+		}
+
+		return &http.Cookie{
+			Name:     auth.runtime.SessionCookieName,
+			Value:    session.UUID,
+			Path:     "/",
+			Domain:   fmt.Sprintf(".%s", tsCookieDomain),
+			Expires:  expiresAt,
+			MaxAge:   int(time.Until(expiresAt).Seconds()),
+			Secure:   auth.config.Auth.SecureCookie,
+			HttpOnly: true,
+			SameSite: http.SameSiteLaxMode,
+		}, nil
+	}
+
+	return &http.Cookie{
+		Name:     auth.runtime.SessionCookieName,
+		Value:    session.UUID,
+		Path:     "/",
+		Domain:   fmt.Sprintf(".%s", auth.runtime.CookieDomain),
+		Expires:  expiresAt,
+		MaxAge:   int(time.Until(expiresAt).Seconds()),
+		Secure:   auth.config.Auth.SecureCookie,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	}, nil
 }
 
-func (auth *AuthService) RefreshSessionCookie(c *gin.Context) error {
-	cookie, err := c.Cookie(auth.config.SessionCookieName)
+func (auth *AuthService) RefreshSession(ctx context.Context, uuid string) (*http.Cookie, error) {
+	session, err := auth.queries.GetSession(ctx, uuid)
 
 	if err != nil {
-		return err
-	}
-
-	session, err := auth.queries.GetSession(c, cookie)
-
-	if err != nil {
-		return err
+		return nil, fmt.Errorf("failed to retrieve session: %w", err)
 	}
 
 	currentTime := time.Now().Unix()
 
 	var refreshThreshold int64
 
-	if auth.config.SessionExpiry <= int(time.Hour.Seconds()) {
-		refreshThreshold = int64(auth.config.SessionExpiry / 2)
+	if auth.config.Auth.SessionExpiry <= int(time.Hour.Seconds()) {
+		refreshThreshold = int64(auth.config.Auth.SessionExpiry / 2)
 	} else {
 		refreshThreshold = int64(time.Hour.Seconds())
 	}
 
 	if session.Expiry-currentTime > refreshThreshold {
-		return nil
+		return nil, nil
 	}
 
 	newExpiry := session.Expiry + refreshThreshold
 
-	_, err = auth.queries.UpdateSession(c, repository.UpdateSessionParams{
+	_, err = auth.queries.UpdateSession(ctx, repository.UpdateSessionParams{
 		Username:    session.Username,
 		Email:       session.Email,
 		Name:        session.Name,
@@ -374,246 +438,85 @@ func (auth *AuthService) RefreshSessionCookie(c *gin.Context) error {
 	})
 
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("failed to update session expiry: %w", err)
 	}
 
-	c.SetCookie(auth.config.SessionCookieName, cookie, int(newExpiry-currentTime), "/", fmt.Sprintf(".%s", auth.config.CookieDomain), auth.config.SecureCookie, true)
-	tlog.App.Trace().Str("username", session.Username).Msg("Session cookie refreshed")
+	return &http.Cookie{
+		Name:     auth.runtime.SessionCookieName,
+		Value:    session.UUID,
+		Path:     "/",
+		Domain:   fmt.Sprintf(".%s", auth.runtime.CookieDomain),
+		Expires:  time.Now().Add(time.Duration(newExpiry-currentTime) * time.Second),
+		MaxAge:   int(newExpiry - currentTime),
+		Secure:   auth.config.Auth.SecureCookie,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	}, nil
 
-	return nil
 }
 
-func (auth *AuthService) DeleteSessionCookie(c *gin.Context) error {
-	cookie, err := c.Cookie(auth.config.SessionCookieName)
+func (auth *AuthService) DeleteSession(ctx context.Context, uuid string) (*http.Cookie, error) {
+	err := auth.queries.DeleteSession(ctx, uuid)
 
 	if err != nil {
-		return err
+		auth.log.App.Error().Err(err).Str("uuid", uuid).Msg("Failed to delete session from database")
 	}
 
-	err = auth.queries.DeleteSession(c, cookie)
-
-	if err != nil {
-		return err
-	}
-
-	c.SetCookie(auth.config.SessionCookieName, "", -1, "/", fmt.Sprintf(".%s", auth.config.CookieDomain), auth.config.SecureCookie, true)
-
-	return nil
+	return &http.Cookie{
+		Name:     auth.runtime.SessionCookieName,
+		Value:    "",
+		Path:     "/",
+		Domain:   fmt.Sprintf(".%s", auth.runtime.CookieDomain),
+		Expires:  time.Now(),
+		MaxAge:   -1,
+		Secure:   auth.config.Auth.SecureCookie,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	}, nil
 }
 
-func (auth *AuthService) GetSessionCookie(c *gin.Context) (repository.Session, error) {
-	cookie, err := c.Cookie(auth.config.SessionCookieName)
+func (auth *AuthService) GetSession(ctx context.Context, uuid string) (*repository.Session, error) {
+	session, err := auth.queries.GetSession(ctx, uuid)
 
 	if err != nil {
-		return repository.Session{}, err
-	}
-
-	session, err := auth.queries.GetSession(c, cookie)
-
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return repository.Session{}, fmt.Errorf("session not found")
+		if errors.Is(err, repository.ErrNotFound) {
+			return nil, errors.New("session not found")
 		}
-		return repository.Session{}, err
+		return nil, err
 	}
 
 	currentTime := time.Now().Unix()
 
-	if auth.config.SessionMaxLifetime != 0 && session.CreatedAt != 0 {
-		if currentTime-session.CreatedAt > int64(auth.config.SessionMaxLifetime) {
-			err = auth.queries.DeleteSession(c, cookie)
+	if auth.config.Auth.SessionMaxLifetime != 0 && session.CreatedAt != 0 {
+		if currentTime-session.CreatedAt > int64(auth.config.Auth.SessionMaxLifetime) {
+			err = auth.queries.DeleteSession(ctx, uuid)
 			if err != nil {
-				tlog.App.Error().Err(err).Msg("Failed to delete session exceeding max lifetime")
+				return nil, fmt.Errorf("failed to delete expired session: %w", err)
 			}
-			return repository.Session{}, fmt.Errorf("session expired due to max lifetime exceeded")
+			return nil, fmt.Errorf("session max lifetime exceeded")
 		}
 	}
 
 	if currentTime > session.Expiry {
-		err = auth.queries.DeleteSession(c, cookie)
+		err = auth.queries.DeleteSession(ctx, uuid)
 		if err != nil {
-			tlog.App.Error().Err(err).Msg("Failed to delete expired session")
+			return nil, fmt.Errorf("failed to delete expired session: %w", err)
 		}
-		return repository.Session{}, fmt.Errorf("session expired")
+		return nil, fmt.Errorf("session expired")
 	}
 
-	return repository.Session{
-		UUID:        session.UUID,
-		Username:    session.Username,
-		Email:       session.Email,
-		Name:        session.Name,
-		Provider:    session.Provider,
-		TotpPending: session.TotpPending,
-		OAuthGroups: session.OAuthGroups,
-		OAuthName:   session.OAuthName,
-		OAuthSub:    session.OAuthSub,
-	}, nil
+	return &session, nil
 }
 
 func (auth *AuthService) LocalAuthConfigured() bool {
-	return len(auth.config.Users) > 0
+	return len(auth.runtime.LocalUsers) > 0
 }
 
-func (auth *AuthService) LdapAuthConfigured() bool {
-	return auth.ldap.IsConfigured()
-}
-
-func (auth *AuthService) IsUserAllowed(c *gin.Context, context config.UserContext, acls config.App) bool {
-	if context.OAuth {
-		tlog.App.Debug().Msg("Checking OAuth whitelist")
-		return utils.CheckFilter(acls.OAuth.Whitelist, context.Email)
-	}
-
-	if acls.Users.Block != "" {
-		tlog.App.Debug().Msg("Checking blocked users")
-		if utils.CheckFilter(acls.Users.Block, context.Username) {
-			return false
-		}
-	}
-
-	tlog.App.Debug().Msg("Checking users")
-	return utils.CheckFilter(acls.Users.Allow, context.Username)
-}
-
-func (auth *AuthService) IsInOAuthGroup(c *gin.Context, context config.UserContext, requiredGroups string) bool {
-	if requiredGroups == "" {
-		return true
-	}
-
-	for id := range config.OverrideProviders {
-		if context.Provider == id {
-			tlog.App.Info().Str("provider", id).Msg("OAuth groups not supported for this provider")
-			return true
-		}
-	}
-
-	for userGroup := range strings.SplitSeq(context.OAuthGroups, ",") {
-		if utils.CheckFilter(requiredGroups, strings.TrimSpace(userGroup)) {
-			tlog.App.Trace().Str("group", userGroup).Str("required", requiredGroups).Msg("User group matched")
-			return true
-		}
-	}
-
-	tlog.App.Debug().Msg("No groups matched")
-	return false
-}
-
-func (auth *AuthService) IsInLdapGroup(c *gin.Context, context config.UserContext, requiredGroups string) bool {
-	if requiredGroups == "" {
-		return true
-	}
-
-	for userGroup := range strings.SplitSeq(context.LdapGroups, ",") {
-		if utils.CheckFilter(requiredGroups, strings.TrimSpace(userGroup)) {
-			tlog.App.Trace().Str("group", userGroup).Str("required", requiredGroups).Msg("User group matched")
-			return true
-		}
-	}
-
-	tlog.App.Debug().Msg("No groups matched")
-	return false
-}
-
-func (auth *AuthService) IsAuthEnabled(uri string, path config.AppPath) (bool, error) {
-	// Check for block list
-	if path.Block != "" {
-		regex, err := regexp.Compile(path.Block)
-
-		if err != nil {
-			return true, err
-		}
-
-		if !regex.MatchString(uri) {
-			return false, nil
-		}
-	}
-
-	// Check for allow list
-	if path.Allow != "" {
-		regex, err := regexp.Compile(path.Allow)
-
-		if err != nil {
-			return true, err
-		}
-
-		if regex.MatchString(uri) {
-			return false, nil
-		}
-	}
-
-	return true, nil
-}
-
-func (auth *AuthService) GetBasicAuth(c *gin.Context) *config.User {
-	username, password, ok := c.Request.BasicAuth()
-	if !ok {
-		tlog.App.Debug().Msg("No basic auth provided")
-		return nil
-	}
-	return &config.User{
-		Username: username,
-		Password: password,
-	}
-}
-
-func (auth *AuthService) CheckIP(acls config.AppIP, ip string) bool {
-	// Merge the global and app IP filter
-	blockedIps := append(auth.config.IP.Block, acls.Block...)
-	allowedIPs := append(auth.config.IP.Allow, acls.Allow...)
-
-	for _, blocked := range blockedIps {
-		res, err := utils.FilterIP(blocked, ip)
-		if err != nil {
-			tlog.App.Warn().Err(err).Str("item", blocked).Msg("Invalid IP/CIDR in block list")
-			continue
-		}
-		if res {
-			tlog.App.Debug().Str("ip", ip).Str("item", blocked).Msg("IP is in blocked list, denying access")
-			return false
-		}
-	}
-
-	for _, allowed := range allowedIPs {
-		res, err := utils.FilterIP(allowed, ip)
-		if err != nil {
-			tlog.App.Warn().Err(err).Str("item", allowed).Msg("Invalid IP/CIDR in allow list")
-			continue
-		}
-		if res {
-			tlog.App.Debug().Str("ip", ip).Str("item", allowed).Msg("IP is in allowed list, allowing access")
-			return true
-		}
-	}
-
-	if len(allowedIPs) > 0 {
-		tlog.App.Debug().Str("ip", ip).Msg("IP not in allow list, denying access")
-		return false
-	}
-
-	tlog.App.Debug().Str("ip", ip).Msg("IP not in allow or block list, allowing by default")
-	return true
-}
-
-func (auth *AuthService) IsBypassedIP(acls config.AppIP, ip string) bool {
-	for _, bypassed := range acls.Bypass {
-		res, err := utils.FilterIP(bypassed, ip)
-		if err != nil {
-			tlog.App.Warn().Err(err).Str("item", bypassed).Msg("Invalid IP/CIDR in bypass list")
-			continue
-		}
-		if res {
-			tlog.App.Debug().Str("ip", ip).Str("item", bypassed).Msg("IP is in bypass list, allowing access")
-			return true
-		}
-	}
-
-	tlog.App.Debug().Str("ip", ip).Msg("IP not in bypass list, continuing with authentication")
-	return false
+func (auth *AuthService) LDAPAuthConfigured() bool {
+	return auth.ldap != nil
 }
 
 func (auth *AuthService) NewOAuthSession(serviceName string, params OAuthURLParams) (string, OAuthPendingSession, error) {
-	auth.ensureOAuthSessionLimit()
-
 	service, ok := auth.oauthBroker.GetService(serviceName)
 
 	if !ok {
@@ -637,9 +540,7 @@ func (auth *AuthService) NewOAuthSession(serviceName string, params OAuthURLPara
 		CallbackParams: params,
 	}
 
-	auth.oauthMutex.Lock()
-	auth.oauthPendingSessions[sessionId.String()] = &session
-	auth.oauthMutex.Unlock()
+	auth.caches.oauth.Set(sessionId.String(), session, time.Minute*10)
 
 	return sessionId.String(), session, nil
 }
@@ -655,10 +556,10 @@ func (auth *AuthService) GetOAuthURL(sessionId string) (string, error) {
 }
 
 func (auth *AuthService) GetOAuthToken(sessionId string, code string) (*oauth2.Token, error) {
-	session, err := auth.GetOAuthPendingSession(sessionId)
+	session, ok := auth.caches.oauth.Get(sessionId)
 
-	if err != nil {
-		return nil, err
+	if !ok {
+		return nil, fmt.Errorf("oauth session not found: %s", sessionId)
 	}
 
 	token, err := (*session.Service).GetToken(code, session.Verifier)
@@ -667,28 +568,33 @@ func (auth *AuthService) GetOAuthToken(sessionId string, code string) (*oauth2.T
 		return nil, fmt.Errorf("failed to exchange code for token: %w", err)
 	}
 
-	auth.oauthMutex.Lock()
 	session.Token = token
-	auth.oauthMutex.Unlock()
+
+	// ttl 0 means keep current expiration
+	ok = auth.caches.oauth.Update(sessionId, session, 0)
+
+	if !ok {
+		return nil, fmt.Errorf("failed to update oauth session with token: %s", sessionId)
+	}
 
 	return token, nil
 }
 
-func (auth *AuthService) GetOAuthUserinfo(sessionId string) (config.Claims, error) {
+func (auth *AuthService) GetOAuthUserinfo(sessionId string) (*model.Claims, error) {
 	session, err := auth.GetOAuthPendingSession(sessionId)
 
 	if err != nil {
-		return config.Claims{}, err
+		return nil, err
 	}
 
 	if session.Token == nil {
-		return config.Claims{}, fmt.Errorf("oauth token not found for session: %s", sessionId)
+		return nil, fmt.Errorf("oauth token not found for session: %s", sessionId)
 	}
 
 	userinfo, err := (*session.Service).GetUserinfo(session.Token)
 
 	if err != nil {
-		return config.Claims{}, fmt.Errorf("failed to get userinfo: %w", err)
+		return nil, fmt.Errorf("failed to get userinfo: %w", err)
 	}
 
 	return userinfo, nil
@@ -705,131 +611,75 @@ func (auth *AuthService) GetOAuthService(sessionId string) (OAuthServiceImpl, er
 }
 
 func (auth *AuthService) EndOAuthSession(sessionId string) {
-	auth.oauthMutex.Lock()
-	delete(auth.oauthPendingSessions, sessionId)
-	auth.oauthMutex.Unlock()
-}
-
-func (auth *AuthService) CleanupOAuthSessionsRoutine() {
-	ticker := time.NewTicker(30 * time.Minute)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		auth.oauthMutex.Lock()
-
-		now := time.Now()
-
-		for sessionId, session := range auth.oauthPendingSessions {
-			if now.After(session.ExpiresAt) {
-				delete(auth.oauthPendingSessions, sessionId)
-			}
-		}
-
-		auth.oauthMutex.Unlock()
-	}
+	auth.caches.oauth.Delete(sessionId)
 }
 
 func (auth *AuthService) GetOAuthPendingSession(sessionId string) (*OAuthPendingSession, error) {
-	auth.ensureOAuthSessionLimit()
-
-	auth.oauthMutex.RLock()
-	session, exists := auth.oauthPendingSessions[sessionId]
-	auth.oauthMutex.RUnlock()
+	session, exists := auth.caches.oauth.Get(sessionId)
 
 	if !exists {
 		return &OAuthPendingSession{}, fmt.Errorf("oauth session not found: %s", sessionId)
 	}
 
-	if time.Now().After(session.ExpiresAt) {
-		auth.oauthMutex.Lock()
-		delete(auth.oauthPendingSessions, sessionId)
-		auth.oauthMutex.Unlock()
-		return &OAuthPendingSession{}, fmt.Errorf("oauth session expired: %s", sessionId)
-	}
-
-	return session, nil
-}
-
-func (auth *AuthService) ensureOAuthSessionLimit() {
-	auth.oauthMutex.Lock()
-	defer auth.oauthMutex.Unlock()
-
-	if len(auth.oauthPendingSessions) >= MaxOAuthPendingSessions {
-
-		cleanupIds := make([]string, 0, OAuthCleanupCount)
-
-		for range OAuthCleanupCount {
-			oldestId := ""
-			oldestTime := int64(0)
-
-			for id, session := range auth.oauthPendingSessions {
-				if oldestTime == 0 {
-					oldestId = id
-					oldestTime = session.ExpiresAt.Unix()
-					continue
-				}
-				if slices.Contains(cleanupIds, id) {
-					continue
-				}
-				if session.ExpiresAt.Unix() < oldestTime {
-					oldestId = id
-					oldestTime = session.ExpiresAt.Unix()
-				}
-			}
-
-			cleanupIds = append(cleanupIds, oldestId)
-		}
-
-		for _, id := range cleanupIds {
-			delete(auth.oauthPendingSessions, id)
-		}
-	}
+	return &session, nil
 }
 
 func (auth *AuthService) lockdownMode() {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	auth.lockdownCtx = ctx
-	auth.lockdownCancelFunc = cancel
+	auth.lockdown.mu.Lock()
 
-	auth.loginMutex.Lock()
-
-	tlog.App.Warn().Msg("Multiple login attempts detected, possibly DDOS attack. Activating temporary lockdown.")
-
-	auth.lockdown = &Lockdown{
-		Active:      true,
-		ActiveUntil: time.Now().Add(time.Duration(auth.config.LoginTimeout) * time.Second),
+	if auth.lockdown.active {
+		auth.lockdown.mu.Unlock()
+		return
 	}
 
-	// At this point all login attemps will also expire so,
-	// we might as well clear them to free up memory
-	auth.loginAttempts = make(map[string]*LoginAttempt)
+	ctx, cancel := context.WithCancel(context.Background())
 
-	timer := time.NewTimer(time.Until(auth.lockdown.ActiveUntil))
+	auth.log.App.Warn().Msg("Too many failed login attempts, entering lockdown mode")
+
+	auth.lockdown.active = true
+	auth.lockdown.ctx = ctx
+	auth.lockdown.cancelFunc = cancel
+	auth.lockdown.until = time.Now().Add(time.Duration(auth.config.Auth.LoginTimeout) * time.Second)
+
+	timer := time.NewTimer(time.Until(auth.lockdown.until))
+
+	auth.lockdown.mu.Unlock()
+
+	defer cancel()
 	defer timer.Stop()
-
-	auth.loginMutex.Unlock()
 
 	select {
 	case <-timer.C:
 		// Timer expired, end lockdown
 	case <-ctx.Done():
 		// Context cancelled, end lockdown
+	case <-auth.ctx.Done():
+		// Service is shutting down, end lockdown
 	}
 
-	auth.loginMutex.Lock()
+	auth.lockdown.mu.Lock()
 
-	tlog.App.Info().Msg("Lockdown period ended, resuming normal operation")
-	auth.lockdown = nil
-	auth.loginMutex.Unlock()
+	auth.log.App.Info().Msg("Exiting lockdown mode")
+
+	auth.lockdown.active = false
+	auth.lockdown.until = time.Time{}
+	auth.lockdown.ctx = nil
+	auth.lockdown.cancelFunc = nil
+
+	auth.lockdown.mu.Unlock()
 }
 
-// Function only used for testing - do not use in prod!
-func (auth *AuthService) ClearRateLimitsTestingOnly() {
-	auth.loginMutex.Lock()
-	auth.loginAttempts = make(map[string]*LoginAttempt)
-	if auth.lockdown != nil {
-		auth.lockdownCancelFunc()
+func (auth *AuthService) IsInLockdown() (bool, int) {
+	auth.lockdown.mu.RLock()
+	defer auth.lockdown.mu.RUnlock()
+	if auth.lockdown.active {
+		remaining := int(time.Until(auth.lockdown.until).Seconds())
+		return true, remaining
 	}
-	auth.loginMutex.Unlock()
+	return false, 0
+}
+
+// mostly a testing function, not useful for anything else
+func (auth *AuthService) ClearLoginAttempts() {
+	auth.caches.login.Clear()
 }

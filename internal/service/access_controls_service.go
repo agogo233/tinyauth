@@ -1,58 +1,66 @@
 package service
 
 import (
-	"errors"
 	"strings"
 
-	"github.com/tinyauthapp/tinyauth/internal/config"
-	"github.com/tinyauthapp/tinyauth/internal/utils/tlog"
+	"github.com/tinyauthapp/tinyauth/internal/model"
+	"github.com/tinyauthapp/tinyauth/internal/utils/logger"
 )
 
 type LabelProvider interface {
-	GetLabels(appDomain string) (config.App, error)
+	GetLabels(appDomain string) (*model.App, error)
 }
 
 type AccessControlsService struct {
-	labelProvider LabelProvider
-	static        map[string]config.App
+	log           *logger.Logger
+	config        model.Config
+	labelProvider *LabelProvider
 }
 
-func NewAccessControlsService(labelProvider LabelProvider, static map[string]config.App) *AccessControlsService {
+func NewAccessControlsService(
+	log *logger.Logger,
+	config model.Config,
+	labelProvider *LabelProvider) *AccessControlsService {
+
 	return &AccessControlsService{
+		log:           log,
+		config:        config,
 		labelProvider: labelProvider,
-		static:        static,
 	}
 }
 
-func (acls *AccessControlsService) Init() error {
-	return nil // No initialization needed
-}
+func (service *AccessControlsService) lookupStaticACLs(domain string) *model.App {
+	var nameMatch *model.App
 
-func (acls *AccessControlsService) lookupStaticACLs(domain string) (config.App, error) {
-	for app, config := range acls.static {
+	// First try to find a matching app by domain, then fallback to matching by app name (subdomain)
+	for app, config := range service.config.Apps {
 		if config.Config.Domain == domain {
-			tlog.App.Debug().Str("name", app).Msg("Found matching container by domain")
-			return config, nil
+			service.log.App.Debug().Str("name", app).Msg("Found matching container by domain")
+			return &config
 		}
-
 		if strings.SplitN(domain, ".", 2)[0] == app {
-			tlog.App.Debug().Str("name", app).Msg("Found matching container by app name")
-			return config, nil
+			service.log.App.Debug().Str("name", app).Msg("Found matching container by app name")
+			nameMatch = &config
 		}
 	}
-	return config.App{}, errors.New("no results")
+
+	return nameMatch
 }
 
-func (acls *AccessControlsService) GetAccessControls(domain string) (config.App, error) {
+func (service *AccessControlsService) GetAccessControls(domain string) (*model.App, error) {
 	// First check in the static config
-	app, err := acls.lookupStaticACLs(domain)
+	app := service.lookupStaticACLs(domain)
 
-	if err == nil {
-		tlog.App.Debug().Msg("Using ACls from static configuration")
+	if app != nil {
+		service.log.App.Debug().Msg("Using static ACLs for app")
 		return app, nil
 	}
 
-	// Fallback to label provider
-	tlog.App.Debug().Msg("Falling back to label provider for ACLs")
-	return acls.labelProvider.GetLabels(domain)
+	// If we have a label provider configured, try to get ACLs from it
+	if service.labelProvider != nil && *service.labelProvider != nil {
+		return (*service.labelProvider).GetLabels(domain)
+	}
+
+	// no labels
+	return nil, nil
 }
