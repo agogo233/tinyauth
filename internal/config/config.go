@@ -7,7 +7,7 @@ func NewDefaultConfiguration() *Config {
 			Path: "./tinyauth.db",
 		},
 		Analytics: AnalyticsConfig{
-			Enabled: true,
+			Enabled: false,
 		},
 		Resources: ResourcesConfig{
 			Enabled: true,
