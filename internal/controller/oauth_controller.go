@@ -3,6 +3,7 @@ package controller
 import (
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -11,6 +12,8 @@ import (
 	"github.com/tinyauthapp/tinyauth/internal/service"
 	"github.com/tinyauthapp/tinyauth/internal/utils"
 	"github.com/tinyauthapp/tinyauth/internal/utils/logger"
+	"github.com/weppos/publicsuffix-go/publicsuffix"
+	"go.uber.org/dig"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/go-querystring/query"
@@ -22,26 +25,30 @@ type OAuthRequest struct {
 
 type OAuthController struct {
 	log     *logger.Logger
-	config  model.Config
-	runtime model.RuntimeConfig
+	config  *model.Config
+	runtime *model.RuntimeConfig
 	auth    *service.AuthService
 }
 
-func NewOAuthController(
-	log *logger.Logger,
-	config model.Config,
-	runtimeConfig model.RuntimeConfig,
-	router *gin.RouterGroup,
-	auth *service.AuthService,
-) *OAuthController {
+type OAuthControllerInput struct {
+	dig.In
+
+	Log           *logger.Logger
+	Config        *model.Config
+	RuntimeConfig *model.RuntimeConfig
+	RouterGroup   *gin.RouterGroup `name:"apiRouterGroup"`
+	AuthService   *service.AuthService
+}
+
+func NewOAuthController(i OAuthControllerInput) *OAuthController {
 	controller := &OAuthController{
-		log:     log,
-		config:  config,
-		runtime: runtimeConfig,
-		auth:    auth,
+		log:     i.Log,
+		config:  i.Config,
+		runtime: i.RuntimeConfig,
+		auth:    i.AuthService,
 	}
 
-	oauthGroup := router.Group("/oauth")
+	oauthGroup := i.RouterGroup.Group("/oauth")
 	oauthGroup.GET("/url/:provider", controller.oauthURLHandler)
 	oauthGroup.GET("/callback/:provider", controller.oauthCallbackHandler)
 
@@ -61,7 +68,7 @@ func (controller *OAuthController) oauthURLHandler(c *gin.Context) {
 		return
 	}
 
-	var reqParams service.OAuthURLParams
+	var reqParams service.OAuthCallbackParams
 
 	err = c.BindQuery(&reqParams)
 
@@ -75,15 +82,13 @@ func (controller *OAuthController) oauthURLHandler(c *gin.Context) {
 	}
 
 	if !controller.isOidcRequest(reqParams) {
-		isRedirectSafe := utils.IsRedirectSafe(reqParams.RedirectURI, controller.runtime.CookieDomain)
-
-		if !isRedirectSafe {
+		if !controller.isRedirectSafe(reqParams.RedirectURI) {
 			controller.log.App.Warn().Str("redirectUri", reqParams.RedirectURI).Msg("Unsafe redirect URI, ignoring")
 			reqParams.RedirectURI = ""
 		}
 	}
 
-	sessionId, _, err := controller.auth.NewOAuthSession(req.Provider, reqParams)
+	sessionId, err := controller.auth.NewOAuthSession(req.Provider, reqParams)
 
 	if err != nil {
 		controller.log.App.Error().Err(err).Msg("Failed to create new OAuth session")
@@ -272,13 +277,14 @@ func (controller *OAuthController) oauthCallbackHandler(c *gin.Context) {
 			c.Redirect(http.StatusTemporaryRedirect, fmt.Sprintf("%s/error", controller.runtime.AppURL))
 			return
 		}
-		c.Redirect(http.StatusTemporaryRedirect, fmt.Sprintf("%s/authorize?%s", controller.runtime.AppURL, queries.Encode()))
+		c.Redirect(http.StatusTemporaryRedirect, fmt.Sprintf("%s/oidc/authorize?%s", controller.runtime.AppURL, queries.Encode()))
 		return
 	}
 
 	if oauthPendingSession.CallbackParams.RedirectURI != "" {
 		queries, err := query.Values(RedirectQuery{
 			RedirectURI: oauthPendingSession.CallbackParams.RedirectURI,
+			LoginFor:    FrontendLoginForApp,
 		})
 
 		if err != nil {
@@ -294,11 +300,8 @@ func (controller *OAuthController) oauthCallbackHandler(c *gin.Context) {
 	c.Redirect(http.StatusTemporaryRedirect, controller.runtime.AppURL)
 }
 
-func (controller *OAuthController) isOidcRequest(params service.OAuthURLParams) bool {
-	return params.Scope != "" &&
-		params.ResponseType != "" &&
-		params.ClientID != "" &&
-		params.RedirectURI != ""
+func (controller *OAuthController) isOidcRequest(params service.OAuthCallbackParams) bool {
+	return params.LoginFor == string(FrontendLoginForOIDC)
 }
 
 func (controller *OAuthController) getCookieDomain() string {
@@ -306,4 +309,57 @@ func (controller *OAuthController) getCookieDomain() string {
 		return "." + controller.runtime.CookieDomain
 	}
 	return controller.runtime.CookieDomain
+}
+
+func (controller *OAuthController) isRedirectSafe(redirectURI string) bool {
+	u, err := url.Parse(redirectURI)
+
+	if err != nil || u.Host == "" || u.Scheme == "" {
+		return false
+	}
+
+	for _, allowed := range controller.runtime.TrustedDomains {
+		tu, err := url.Parse(allowed)
+		if err != nil {
+			controller.log.App.Error().Err(err).Str("allowed", allowed).Msg("Failed to parse trusted domain")
+			continue
+		}
+
+		if tu.Scheme != u.Scheme {
+			continue
+		}
+
+		// exact match
+		if strings.EqualFold(u.Host, tu.Host) {
+			return true
+		}
+
+		// if subdomains are disabled, end here
+		if !controller.config.Auth.SubdomainsEnabled {
+			continue
+		}
+
+		// get the root domain (e.g. tinyauth.example.com -> example.com or
+		// tinyauth.sub.example.com -> sub.example.com)
+		_, root, ok := strings.Cut(tu.Host, ".")
+		if !ok {
+			continue
+		}
+
+		root = strings.ToLower(root)
+
+		// check if the root domain is in the psl
+		_, err = publicsuffix.DomainFromListWithOptions(publicsuffix.DefaultList, root, nil)
+
+		if err != nil {
+			continue
+		}
+
+		// subdomain match
+		if strings.HasSuffix(strings.ToLower(u.Host), "."+root) {
+			return true
+		}
+	}
+
+	return false
 }

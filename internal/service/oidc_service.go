@@ -14,17 +14,20 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"slices"
 
 	"github.com/go-jose/go-jose/v4"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/steveiliop56/ding"
 	"github.com/tinyauthapp/tinyauth/internal/model"
 	"github.com/tinyauthapp/tinyauth/internal/repository"
 	"github.com/tinyauthapp/tinyauth/internal/utils"
 	"github.com/tinyauthapp/tinyauth/internal/utils/logger"
+	"go.uber.org/dig"
 )
 
 var (
@@ -106,14 +109,14 @@ type TokenResponse struct {
 }
 
 type AuthorizeRequest struct {
-	Scope               string `json:"scope" binding:"required"`
-	ResponseType        string `json:"response_type" binding:"required"`
-	ClientID            string `json:"client_id" binding:"required"`
-	RedirectURI         string `json:"redirect_uri" binding:"required"`
-	State               string `json:"state"`
-	Nonce               string `json:"nonce"`
-	CodeChallenge       string `json:"code_challenge"`
-	CodeChallengeMethod string `json:"code_challenge_method"`
+	Scope               string `form:"scope" json:"scope" url:"scope"`
+	ResponseType        string `form:"response_type" json:"response_type" url:"response_type"`
+	ClientID            string `form:"client_id" json:"client_id" url:"client_id"`
+	RedirectURI         string `form:"redirect_uri" json:"redirect_uri" url:"redirect_uri"`
+	State               string `form:"state" json:"state" url:"state"`
+	Nonce               string `form:"nonce" json:"nonce" url:"nonce"`
+	CodeChallenge       string `form:"code_challenge" json:"code_challenge" url:"code_challenge"`
+	CodeChallengeMethod string `form:"code_challenge_method" json:"code_challenge_method" url:"code_challenge_method"`
 }
 
 type AuthorizeCodeEntry struct {
@@ -132,8 +135,8 @@ type UsedCodeEntry struct {
 
 type OIDCService struct {
 	log     *logger.Logger
-	config  model.Config
-	runtime model.RuntimeConfig
+	config  *model.Config
+	runtime *model.RuntimeConfig
 	queries repository.Store
 
 	clients    map[string]model.OIDCClientConfig
@@ -142,24 +145,30 @@ type OIDCService struct {
 	issuer     string
 
 	caches struct {
-		code     *CacheStore[AuthorizeCodeEntry]
-		usedCode *CacheStore[UsedCodeEntry]
+		code      *CacheStore[AuthorizeCodeEntry]
+		usedCode  *CacheStore[UsedCodeEntry]
+		authorize *CacheStore[AuthorizeRequest]
 	}
 }
 
-func NewOIDCService(
-	log *logger.Logger,
-	config model.Config,
-	runtime model.RuntimeConfig,
-	queries repository.Store,
-	dg *ding.Ding) (*OIDCService, error) {
+type OIDCServiceInput struct {
+	dig.In
+
+	Log     *logger.Logger
+	Config  *model.Config
+	Runtime *model.RuntimeConfig
+	Queries repository.Store
+	Ding    *ding.Ding
+}
+
+func NewOIDCService(i OIDCServiceInput) (*OIDCService, error) {
 	// If not configured, skip init
-	if len(runtime.OIDCClients) == 0 {
+	if len(i.Config.OIDC.Clients) == 0 {
 		return nil, nil
 	}
 
 	// Ensure issuer is https
-	uissuer, err := url.Parse(runtime.AppURL)
+	uissuer, err := url.Parse(i.Runtime.AppURL)
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse app url: %w", err)
@@ -172,14 +181,14 @@ func NewOIDCService(
 	issuer := fmt.Sprintf("%s://%s", uissuer.Scheme, uissuer.Host)
 
 	// Create/load private and public keys
-	if strings.TrimSpace(config.OIDC.PrivateKeyPath) == "" ||
-		strings.TrimSpace(config.OIDC.PublicKeyPath) == "" {
+	if strings.TrimSpace(i.Config.OIDC.PrivateKeyPath) == "" ||
+		strings.TrimSpace(i.Config.OIDC.PublicKeyPath) == "" {
 		return nil, errors.New("private key path and public key path are required")
 	}
 
 	var privateKey *rsa.PrivateKey
 
-	fprivateKey, err := os.ReadFile(config.OIDC.PrivateKeyPath)
+	fprivateKey, err := os.ReadFile(i.Config.OIDC.PrivateKeyPath)
 
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
@@ -198,8 +207,12 @@ func NewOIDCService(
 			Type:  "RSA PRIVATE KEY",
 			Bytes: der,
 		})
-		log.App.Trace().Str("type", "RSA PRIVATE KEY").Msg("Generated private RSA key")
-		err = os.WriteFile(config.OIDC.PrivateKeyPath, encoded, 0600)
+		i.Log.App.Trace().Str("type", "RSA PRIVATE KEY").Msg("Generated private RSA key")
+		err := os.MkdirAll(filepath.Dir(i.Config.OIDC.PrivateKeyPath), 0700)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create directory for private key: %w", err)
+		}
+		err = os.WriteFile(i.Config.OIDC.PrivateKeyPath, encoded, 0600)
 		if err != nil {
 			return nil, fmt.Errorf("failed to write private key to file: %w", err)
 		}
@@ -208,7 +221,7 @@ func NewOIDCService(
 		if block == nil {
 			return nil, errors.New("failed to decode private key")
 		}
-		log.App.Trace().Str("type", block.Type).Msg("Loaded private key")
+		i.Log.App.Trace().Str("type", block.Type).Msg("Loaded private key")
 		privateKey, err = x509.ParsePKCS1PrivateKey(block.Bytes)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse private key: %w", err)
@@ -217,7 +230,7 @@ func NewOIDCService(
 
 	var publicKey crypto.PublicKey
 
-	fpublicKey, err := os.ReadFile(config.OIDC.PublicKeyPath)
+	fpublicKey, err := os.ReadFile(i.Config.OIDC.PublicKeyPath)
 
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("failed to read public key: %w", err)
@@ -233,8 +246,12 @@ func NewOIDCService(
 			Type:  "RSA PUBLIC KEY",
 			Bytes: der,
 		})
-		log.App.Trace().Str("type", "RSA PUBLIC KEY").Msg("Generated public RSA key")
-		err = os.WriteFile(config.OIDC.PublicKeyPath, encoded, 0644)
+		i.Log.App.Trace().Str("type", "RSA PUBLIC KEY").Msg("Generated public RSA key")
+		err := os.MkdirAll(filepath.Dir(i.Config.OIDC.PublicKeyPath), 0700)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create directory for public key: %w", err)
+		}
+		err = os.WriteFile(i.Config.OIDC.PublicKeyPath, encoded, 0644)
 		if err != nil {
 			return nil, err
 		}
@@ -243,7 +260,7 @@ func NewOIDCService(
 		if block == nil {
 			return nil, errors.New("failed to decode public key")
 		}
-		log.App.Trace().Str("type", block.Type).Msg("Loaded public key")
+		i.Log.App.Trace().Str("type", block.Type).Msg("Loaded public key")
 		switch block.Type {
 		case "RSA PUBLIC KEY":
 			publicKey, err = x509.ParsePKCS1PublicKey(block.Bytes)
@@ -273,7 +290,7 @@ func NewOIDCService(
 	// We will reorganize the client into a map with the client ID as the key
 	clients := make(map[string]model.OIDCClientConfig)
 
-	for id, client := range config.OIDC.Clients {
+	for id, client := range i.Config.OIDC.Clients {
 		client.ID = id
 		if client.Name == "" {
 			client.Name = utils.Capitalize(client.ID)
@@ -289,15 +306,15 @@ func NewOIDCService(
 		}
 		client.ClientSecretFile = ""
 		clients[id] = client
-		log.App.Debug().Str("clientId", client.ClientID).Msg("Loaded OIDC client configuration")
+		i.Log.App.Debug().Str("clientId", client.ClientID).Msg("Loaded OIDC client configuration")
 	}
 
 	// Initialize the service
 	service := &OIDCService{
-		log:     log,
-		config:  config,
-		runtime: runtime,
-		queries: queries,
+		log:     i.Log,
+		config:  i.Config,
+		runtime: i.Runtime,
+		queries: i.Queries,
 
 		clients:    clients,
 		privateKey: privateKey,
@@ -306,16 +323,19 @@ func NewOIDCService(
 	}
 
 	// Start cleanup routine
-	dg.Go(service.cleanupRoutine, ding.RingMinor)
+	i.Ding.Go(service.cleanupRoutine, ding.RingMinor)
 
 	// Create caches
 	codeCash := NewCacheStore[AuthorizeCodeEntry](256)
 	usedCode := NewCacheStore[UsedCodeEntry](256)
+	authorize := NewCacheStore[AuthorizeRequest](256)
+
 	service.caches.code = codeCash
 	service.caches.usedCode = usedCode
+	service.caches.authorize = authorize
 
 	// Start cache cleanup routine
-	dg.Go(func(ctx context.Context) {
+	i.Ding.Go(func(ctx context.Context) {
 		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
 
@@ -324,6 +344,7 @@ func NewOIDCService(
 			case <-ticker.C:
 				service.caches.code.Sweep()
 				service.caches.usedCode.Sweep()
+				service.caches.authorize.Sweep()
 			case <-ctx.Done():
 				return
 			}
@@ -855,4 +876,58 @@ func (service *OIDCService) MarkCodeAsUsed(codeHash string, sub string) {
 
 func (service *OIDCService) DeleteSessionBySub(ctx context.Context, sub string) error {
 	return service.queries.DeleteOIDCSessionBySub(ctx, sub)
+}
+
+func (service *OIDCService) CreateAuthorizeRequestTicket(req AuthorizeRequest) string {
+	ticket := utils.GenerateString(32)
+
+	service.caches.authorize.Set(ticket, req, 10*time.Minute)
+
+	return ticket
+}
+
+func (service *OIDCService) GetAuthorizeRequestByTicket(ticket string) (*AuthorizeRequest, bool) {
+	entry, ok := service.caches.authorize.Get(ticket)
+
+	if !ok {
+		return nil, false
+	}
+
+	return &entry, true
+}
+
+func (service *OIDCService) DeleteAuthorizeRequestTicket(ticket string) {
+	service.caches.authorize.Delete(ticket)
+}
+
+// TODO: support signed request objects in the future
+func (service *OIDCService) DecodeAuthorizeJWT(tokenString string) (*AuthorizeRequest, error) {
+	var claims jwt.MapClaims
+
+	token, _, err := jwt.NewParser().ParseUnverified(tokenString, &claims)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse authorize request jwt: %w", err)
+	}
+
+	alg, ok := token.Header["alg"].(string)
+
+	if !ok || alg != "none" || string(token.Signature) != "" {
+		return nil, fmt.Errorf("only unsigned jwts are supported for authorize requests")
+	}
+
+	get := func(k string) string {
+		v, _ := claims[k].(string)
+		return v
+	}
+
+	return &AuthorizeRequest{
+		Scope:               get("scope"),
+		ResponseType:        get("response_type"),
+		ClientID:            get("client_id"),
+		RedirectURI:         get("redirect_uri"),
+		State:               get("state"),
+		Nonce:               get("nonce"),
+		CodeChallenge:       get("code_challenge"),
+		CodeChallengeMethod: get("code_challenge_method"),
+	}, nil
 }

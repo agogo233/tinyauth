@@ -121,14 +121,10 @@ func CreateTestConfigs(t *testing.T) (model.Config, model.RuntimeConfig) {
 		CookieDomain:      "example.com",
 		AppURL:            "https://tinyauth.example.com",
 		SessionCookieName: "tinyauth-session",
-		OIDCClients: func() []model.OIDCClientConfig {
-			var clients []model.OIDCClientConfig
-			for id, client := range config.OIDC.Clients {
-				client.ID = id
-				clients = append(clients, client)
-			}
-			return clients
-		}(),
+		TrustedDomains: []string{
+			"https://tinyauth.example.com",
+			"https://tinyauth.foo.com",
+		},
 	}
 
 	return config, runtime
