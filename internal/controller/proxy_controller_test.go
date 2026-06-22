@@ -1,7 +1,10 @@
-package controller_test
+package controller
 
 import (
 	"context"
+	"encoding/base64"
+	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"testing"
@@ -10,7 +13,6 @@ import (
 	"github.com/steveiliop56/ding"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/tinyauthapp/tinyauth/internal/controller"
 	"github.com/tinyauthapp/tinyauth/internal/model"
 	"github.com/tinyauthapp/tinyauth/internal/repository/memory"
 	"github.com/tinyauthapp/tinyauth/internal/service"
@@ -65,6 +67,17 @@ func TestProxyController(t *testing.T) {
 
 	tests := []testCase{
 		{
+			description: "Should get bad request on invalid proxy",
+			middlewares: []gin.HandlerFunc{},
+			run: func(t *testing.T, router *gin.Engine, recorder *httptest.ResponseRecorder) {
+				req := httptest.NewRequest("GET", "/api/auth/invalid", nil)
+				router.ServeHTTP(recorder, req)
+
+				assert.Equal(t, http.StatusBadRequest, recorder.Code)
+				assert.Contains(t, recorder.Body.String(), "Bad request")
+			},
+		},
+		{
 			description: "Default forward auth should be detected and used for traefik",
 			middlewares: []gin.HandlerFunc{},
 			run: func(t *testing.T, router *gin.Engine, recorder *httptest.ResponseRecorder) {
@@ -75,7 +88,7 @@ func TestProxyController(t *testing.T) {
 				req.Header.Set("user-agent", browserUserAgent)
 				router.ServeHTTP(recorder, req)
 
-				assert.Equal(t, 307, recorder.Code)
+				assert.Equal(t, http.StatusFound, recorder.Code)
 				location := recorder.Header().Get("Location")
 				assert.Contains(t, location, url.QueryEscape("https://test.example.com/"))
 				assert.Contains(t, location, "login_for=app")
@@ -90,7 +103,7 @@ func TestProxyController(t *testing.T) {
 				req.Header.Set("x-original-url", "https://test.example.com/")
 				req.Header.Set("user-agent", browserUserAgent)
 				router.ServeHTTP(recorder, req)
-				assert.Equal(t, 401, recorder.Code)
+				assert.Equal(t, http.StatusUnauthorized, recorder.Code)
 				location := recorder.Header().Get("x-tinyauth-location")
 				assert.Contains(t, location, url.QueryEscape("https://test.example.com/"))
 				assert.Contains(t, location, "login_for=app")
@@ -106,7 +119,7 @@ func TestProxyController(t *testing.T) {
 				req.Header.Set("x-forwarded-proto", "https")
 				req.Header.Set("user-agent", browserUserAgent)
 				router.ServeHTTP(recorder, req)
-				assert.Equal(t, 307, recorder.Code)
+				assert.Equal(t, http.StatusFound, recorder.Code)
 				location := recorder.Header().Get("Location")
 				assert.Contains(t, location, url.QueryEscape("https://test.example.com/hello"))
 				assert.Contains(t, location, "login_for=app")
@@ -124,7 +137,7 @@ func TestProxyController(t *testing.T) {
 				req.Header.Set("user-agent", browserUserAgent)
 				router.ServeHTTP(recorder, req)
 
-				assert.Equal(t, 307, recorder.Code)
+				assert.Equal(t, http.StatusFound, recorder.Code)
 				location := recorder.Header().Get("Location")
 				assert.Contains(t, location, url.QueryEscape("https://test.example.com/"))
 				assert.Contains(t, location, "login_for=app")
@@ -141,7 +154,7 @@ func TestProxyController(t *testing.T) {
 				req.Header.Set("x-forwarded-uri", "/")
 				req.Header.Set("user-agent", browserUserAgent)
 				router.ServeHTTP(recorder, req)
-				assert.Equal(t, 401, recorder.Code)
+				assert.Equal(t, http.StatusUnauthorized, recorder.Code)
 				location := recorder.Header().Get("x-tinyauth-location")
 				assert.Contains(t, location, url.QueryEscape("https://test.example.com/"))
 				assert.Contains(t, location, "login_for=app")
@@ -159,7 +172,7 @@ func TestProxyController(t *testing.T) {
 				req.Header.Set("x-forwarded-uri", "/hello")
 				req.Header.Set("user-agent", browserUserAgent)
 				router.ServeHTTP(recorder, req)
-				assert.Equal(t, 307, recorder.Code)
+				assert.Equal(t, http.StatusFound, recorder.Code)
 				location := recorder.Header().Get("Location")
 				assert.Contains(t, location, url.QueryEscape("https://test.example.com/"))
 				assert.Contains(t, location, "login_for=app")
@@ -176,7 +189,7 @@ func TestProxyController(t *testing.T) {
 				req.Header.Set("x-forwarded-uri", "/")
 				router.ServeHTTP(recorder, req)
 
-				assert.Equal(t, 401, recorder.Code)
+				assert.Equal(t, http.StatusUnauthorized, recorder.Code)
 				assert.Contains(t, recorder.Body.String(), `"status":401`)
 				assert.Contains(t, recorder.Body.String(), `"message":"Unauthorized"`)
 			},
@@ -191,7 +204,7 @@ func TestProxyController(t *testing.T) {
 				req.Header.Set("x-forwarded-uri", "/")
 				router.ServeHTTP(recorder, req)
 
-				assert.Equal(t, 401, recorder.Code)
+				assert.Equal(t, http.StatusUnauthorized, recorder.Code)
 				assert.Contains(t, recorder.Body.String(), `"status":401`)
 				assert.Contains(t, recorder.Body.String(), `"message":"Unauthorized"`)
 			},
@@ -206,7 +219,7 @@ func TestProxyController(t *testing.T) {
 				req.Header.Set("x-forwarded-uri", "/hello")
 				router.ServeHTTP(recorder, req)
 
-				assert.Equal(t, 401, recorder.Code)
+				assert.Equal(t, http.StatusUnauthorized, recorder.Code)
 				assert.Contains(t, recorder.Body.String(), `"status":401`)
 				assert.Contains(t, recorder.Body.String(), `"message":"Unauthorized"`)
 			},
@@ -223,7 +236,7 @@ func TestProxyController(t *testing.T) {
 				req.Header.Set("x-forwarded-uri", "/")
 				router.ServeHTTP(recorder, req)
 
-				assert.Equal(t, 200, recorder.Code)
+				assert.Equal(t, http.StatusOK, recorder.Code)
 				assert.Equal(t, "testuser", recorder.Header().Get("remote-user"))
 				assert.Equal(t, "Testuser", recorder.Header().Get("remote-name"))
 				assert.Equal(t, "testuser@example.com", recorder.Header().Get("remote-email"))
@@ -239,7 +252,7 @@ func TestProxyController(t *testing.T) {
 				req.Header.Set("x-original-url", "https://test.example.com/")
 				router.ServeHTTP(recorder, req)
 
-				assert.Equal(t, 200, recorder.Code)
+				assert.Equal(t, http.StatusOK, recorder.Code)
 				assert.Equal(t, "testuser", recorder.Header().Get("remote-user"))
 				assert.Equal(t, "Testuser", recorder.Header().Get("remote-name"))
 				assert.Equal(t, "testuser@example.com", recorder.Header().Get("remote-email"))
@@ -256,7 +269,7 @@ func TestProxyController(t *testing.T) {
 				req.Header.Set("x-forwarded-proto", "https")
 				router.ServeHTTP(recorder, req)
 
-				assert.Equal(t, 200, recorder.Code)
+				assert.Equal(t, http.StatusOK, recorder.Code)
 				assert.Equal(t, "testuser", recorder.Header().Get("remote-user"))
 				assert.Equal(t, "Testuser", recorder.Header().Get("remote-name"))
 				assert.Equal(t, "testuser@example.com", recorder.Header().Get("remote-email"))
@@ -271,7 +284,7 @@ func TestProxyController(t *testing.T) {
 				req.Header.Set("x-forwarded-proto", "https")
 				req.Header.Set("x-forwarded-uri", "/allowed")
 				router.ServeHTTP(recorder, req)
-				assert.Equal(t, 200, recorder.Code)
+				assert.Equal(t, http.StatusOK, recorder.Code)
 			},
 		},
 		{
@@ -281,7 +294,7 @@ func TestProxyController(t *testing.T) {
 				req := httptest.NewRequest("GET", "/api/auth/nginx", nil)
 				req.Header.Set("x-original-url", "https://path-allow.example.com/allowed")
 				router.ServeHTTP(recorder, req)
-				assert.Equal(t, 200, recorder.Code)
+				assert.Equal(t, http.StatusOK, recorder.Code)
 			},
 		},
 		{
@@ -292,7 +305,7 @@ func TestProxyController(t *testing.T) {
 				req.Host = "path-allow.example.com"
 				req.Header.Set("x-forwarded-proto", "https")
 				router.ServeHTTP(recorder, req)
-				assert.Equal(t, 200, recorder.Code)
+				assert.Equal(t, http.StatusOK, recorder.Code)
 			},
 		},
 		{
@@ -305,7 +318,7 @@ func TestProxyController(t *testing.T) {
 				req.Header.Set("x-forwarded-uri", "/")
 				req.Header.Set("x-forwarded-for", "10.10.10.10")
 				router.ServeHTTP(recorder, req)
-				assert.Equal(t, 200, recorder.Code)
+				assert.Equal(t, http.StatusOK, recorder.Code)
 			},
 		},
 		{
@@ -316,7 +329,7 @@ func TestProxyController(t *testing.T) {
 				req.Header.Set("x-original-url", "https://ip-bypass.example.com/")
 				req.Header.Set("x-forwarded-for", "10.10.10.10")
 				router.ServeHTTP(recorder, req)
-				assert.Equal(t, 200, recorder.Code)
+				assert.Equal(t, http.StatusOK, recorder.Code)
 			},
 		},
 		{
@@ -328,7 +341,7 @@ func TestProxyController(t *testing.T) {
 				req.Header.Set("x-forwarded-proto", "https")
 				req.Header.Set("x-forwarded-for", "10.10.10.10")
 				router.ServeHTTP(recorder, req)
-				assert.Equal(t, 200, recorder.Code)
+				assert.Equal(t, http.StatusOK, recorder.Code)
 			},
 		},
 		{
@@ -342,7 +355,7 @@ func TestProxyController(t *testing.T) {
 				req.Header.Set("x-forwarded-proto", "https")
 				req.Header.Set("x-forwarded-uri", "/")
 				router.ServeHTTP(recorder, req)
-				assert.Equal(t, 200, recorder.Code)
+				assert.Equal(t, http.StatusOK, recorder.Code)
 			},
 		},
 		{
@@ -356,10 +369,299 @@ func TestProxyController(t *testing.T) {
 				req.Header.Set("x-forwarded-proto", "https")
 				req.Header.Set("x-forwarded-uri", "/")
 				router.ServeHTTP(recorder, req)
-				assert.Equal(t, 403, recorder.Code)
+				assert.Equal(t, http.StatusForbidden, recorder.Code)
 				assert.Equal(t, "", recorder.Header().Get("remote-user"))
 				assert.Equal(t, "", recorder.Header().Get("remote-name"))
 				assert.Equal(t, "", recorder.Header().Get("remote-email"))
+			},
+		},
+		{
+			description: "Test IP block rule, with non browser user agent",
+			middlewares: []gin.HandlerFunc{},
+			run: func(t *testing.T, router *gin.Engine, recorder *httptest.ResponseRecorder) {
+				req := httptest.NewRequest("GET", "/api/auth/traefik", nil)
+				req.Header.Set("x-forwarded-host", "ip-block.example.com")
+				req.Header.Set("x-forwarded-proto", "https")
+				req.Header.Set("x-forwarded-uri", "/")
+				req.Header.Set("x-forwarded-for", "10.10.10.10")
+				router.ServeHTTP(recorder, req)
+				assert.Equal(t, http.StatusForbidden, recorder.Code)
+				assert.Contains(t, recorder.Header().Get("x-tinyauth-location"), runtime.AppURL)
+				assert.Contains(t, recorder.Header().Get("x-tinyauth-location"), "ip=10.10.10.10")
+				assert.Contains(t, recorder.Header().Get("x-tinyauth-location"), "ip-block")
+
+			},
+		},
+		{
+			description: "Test IP block rule, with browser user agent",
+			middlewares: []gin.HandlerFunc{},
+			run: func(t *testing.T, router *gin.Engine, recorder *httptest.ResponseRecorder) {
+				req := httptest.NewRequest("GET", "/api/auth/traefik", nil)
+				req.Header.Set("x-forwarded-host", "ip-block.example.com")
+				req.Header.Set("x-forwarded-proto", "https")
+				req.Header.Set("x-forwarded-uri", "/")
+				req.Header.Set("x-forwarded-for", "10.10.10.10")
+				req.Header.Set("user-agent", browserUserAgent)
+				router.ServeHTTP(recorder, req)
+				assert.Equal(t, http.StatusFound, recorder.Code)
+				location := recorder.Header().Get("Location")
+				assert.Contains(t, location, url.QueryEscape("10.10.10.10"))
+				assert.Contains(t, location, url.QueryEscape("ip-block"))
+				assert.Contains(t, location, runtime.AppURL)
+			},
+		},
+		{
+			description: "OAuth allowed group",
+			middlewares: []gin.HandlerFunc{
+				func(ctx *gin.Context) {
+					ctx.Set("context", &model.UserContext{
+						Authenticated: true,
+						Provider:      model.ProviderOAuth,
+						OAuth: &model.OAuthContext{
+							BaseContext: model.BaseContext{
+								Username: "testuser",
+								Name:     "Testuser",
+								Email:    "testuser@example.com",
+							},
+							Groups: []string{"group1"},
+						},
+					})
+					ctx.Next()
+				},
+			},
+			run: func(t *testing.T, router *gin.Engine, recorder *httptest.ResponseRecorder) {
+				req := httptest.NewRequest("GET", "/api/auth/traefik", nil)
+				req.Header.Set("x-forwarded-host", "oauth-group.example.com")
+				req.Header.Set("x-forwarded-proto", "https")
+				req.Header.Set("x-forwarded-uri", "/")
+				router.ServeHTTP(recorder, req)
+				assert.Equal(t, http.StatusOK, recorder.Code)
+				assert.Equal(t, "testuser", recorder.Header().Get("remote-user"))
+				assert.Equal(t, "Testuser", recorder.Header().Get("remote-name"))
+				assert.Equal(t, "testuser@example.com", recorder.Header().Get("remote-email"))
+				assert.Equal(t, "group1", recorder.Header().Get("remote-groups"))
+			},
+		},
+		{
+			description: "OAuth not in required groups and non browser",
+			middlewares: []gin.HandlerFunc{
+				func(ctx *gin.Context) {
+					ctx.Set("context", &model.UserContext{
+						Authenticated: true,
+						Provider:      model.ProviderOAuth,
+						OAuth: &model.OAuthContext{
+							BaseContext: model.BaseContext{
+								Username: "testuser",
+								Name:     "Testuser",
+								Email:    "testuser@example.com",
+							},
+							Groups: []string{"group3"},
+						},
+					})
+					ctx.Next()
+				},
+			},
+			run: func(t *testing.T, router *gin.Engine, recorder *httptest.ResponseRecorder) {
+				req := httptest.NewRequest("GET", "/api/auth/traefik", nil)
+				req.Header.Set("x-forwarded-host", "oauth-group.example.com")
+				req.Header.Set("x-forwarded-proto", "https")
+				req.Header.Set("x-forwarded-uri", "/")
+				router.ServeHTTP(recorder, req)
+				assert.Equal(t, http.StatusForbidden, recorder.Code)
+				assert.Equal(t, "", recorder.Header().Get("remote-user"))
+				assert.Equal(t, "", recorder.Header().Get("remote-name"))
+				assert.Equal(t, "", recorder.Header().Get("remote-email"))
+				assert.Equal(t, "", recorder.Header().Get("remote-groups"))
+				assert.Contains(t, recorder.Header().Get("x-tinyauth-location"), runtime.AppURL)
+				assert.Contains(t, recorder.Header().Get("x-tinyauth-location"), "groupErr=true")
+				assert.Contains(t, recorder.Header().Get("x-tinyauth-location"), "oauth-group")
+			},
+		},
+		{
+			description: "OAuth not in required groups and browser",
+			middlewares: []gin.HandlerFunc{
+				func(ctx *gin.Context) {
+					ctx.Set("context", &model.UserContext{
+						Authenticated: true,
+						Provider:      model.ProviderOAuth,
+						OAuth: &model.OAuthContext{
+							BaseContext: model.BaseContext{
+								Username: "testuser",
+								Name:     "Testuser",
+								Email:    "testuser@example.com",
+							},
+							Groups: []string{"group3"},
+						},
+					})
+					ctx.Next()
+				},
+			},
+			run: func(t *testing.T, router *gin.Engine, recorder *httptest.ResponseRecorder) {
+				req := httptest.NewRequest("GET", "/api/auth/traefik", nil)
+				req.Header.Set("x-forwarded-host", "oauth-group.example.com")
+				req.Header.Set("x-forwarded-proto", "https")
+				req.Header.Set("x-forwarded-uri", "/")
+				req.Header.Set("user-agent", browserUserAgent)
+				router.ServeHTTP(recorder, req)
+				assert.Equal(t, http.StatusFound, recorder.Code)
+				location := recorder.Header().Get("Location")
+				assert.Contains(t, location, "groupErr=true")
+				assert.Contains(t, location, "oauth-group")
+				assert.Contains(t, location, runtime.AppURL)
+			},
+		},
+		{
+			description: "LDAP allowed group",
+			middlewares: []gin.HandlerFunc{
+				func(ctx *gin.Context) {
+					ctx.Set("context", &model.UserContext{
+						Authenticated: true,
+						Provider:      model.ProviderLDAP,
+						LDAP: &model.LDAPContext{
+							BaseContext: model.BaseContext{
+								Username: "testuser",
+								Name:     "Testuser",
+								Email:    "testuser@example.com",
+							},
+							Groups: []string{"group1"},
+						},
+					})
+					ctx.Next()
+				},
+			},
+			run: func(t *testing.T, router *gin.Engine, recorder *httptest.ResponseRecorder) {
+				req := httptest.NewRequest("GET", "/api/auth/traefik", nil)
+				req.Header.Set("x-forwarded-host", "ldap-group.example.com")
+				req.Header.Set("x-forwarded-proto", "https")
+				req.Header.Set("x-forwarded-uri", "/")
+				router.ServeHTTP(recorder, req)
+				assert.Equal(t, http.StatusOK, recorder.Code)
+				assert.Equal(t, "testuser", recorder.Header().Get("remote-user"))
+				assert.Equal(t, "Testuser", recorder.Header().Get("remote-name"))
+				assert.Equal(t, "testuser@example.com", recorder.Header().Get("remote-email"))
+				assert.Equal(t, "group1", recorder.Header().Get("remote-groups"))
+			},
+		},
+		{
+			description: "LDAP not in required groups and non browser",
+			middlewares: []gin.HandlerFunc{
+				func(ctx *gin.Context) {
+					ctx.Set("context", &model.UserContext{
+						Authenticated: true,
+						Provider:      model.ProviderLDAP,
+						LDAP: &model.LDAPContext{
+							BaseContext: model.BaseContext{
+								Username: "testuser",
+								Name:     "Testuser",
+								Email:    "testuser@example.com",
+							},
+							Groups: []string{"group3"},
+						},
+					})
+					ctx.Next()
+				},
+			},
+			run: func(t *testing.T, router *gin.Engine, recorder *httptest.ResponseRecorder) {
+				req := httptest.NewRequest("GET", "/api/auth/traefik", nil)
+				req.Header.Set("x-forwarded-host", "ldap-group.example.com")
+				req.Header.Set("x-forwarded-proto", "https")
+				req.Header.Set("x-forwarded-uri", "/")
+				router.ServeHTTP(recorder, req)
+				assert.Equal(t, http.StatusForbidden, recorder.Code)
+				assert.Equal(t, "", recorder.Header().Get("remote-user"))
+				assert.Equal(t, "", recorder.Header().Get("remote-name"))
+				assert.Equal(t, "", recorder.Header().Get("remote-email"))
+				assert.Equal(t, "", recorder.Header().Get("remote-groups"))
+				assert.Contains(t, recorder.Header().Get("x-tinyauth-location"), runtime.AppURL)
+				assert.Contains(t, recorder.Header().Get("x-tinyauth-location"), "groupErr=true")
+				assert.Contains(t, recorder.Header().Get("x-tinyauth-location"), "ldap-group")
+			},
+		},
+		{
+			description: "LDAP not in required groups and browser",
+			middlewares: []gin.HandlerFunc{
+				func(ctx *gin.Context) {
+					ctx.Set("context", &model.UserContext{
+						Authenticated: true,
+						Provider:      model.ProviderLDAP,
+						LDAP: &model.LDAPContext{
+							BaseContext: model.BaseContext{
+								Username: "testuser",
+								Name:     "Testuser",
+								Email:    "testuser@example.com",
+							},
+							Groups: []string{"group3"},
+						},
+					})
+					ctx.Next()
+				},
+			},
+			run: func(t *testing.T, router *gin.Engine, recorder *httptest.ResponseRecorder) {
+				req := httptest.NewRequest("GET", "/api/auth/traefik", nil)
+				req.Header.Set("x-forwarded-host", "ldap-group.example.com")
+				req.Header.Set("x-forwarded-proto", "https")
+				req.Header.Set("x-forwarded-uri", "/")
+				req.Header.Set("user-agent", browserUserAgent)
+				router.ServeHTTP(recorder, req)
+				assert.Equal(t, http.StatusFound, recorder.Code)
+				location := recorder.Header().Get("Location")
+				assert.Contains(t, location, "groupErr=true")
+				assert.Contains(t, location, "ldap-group")
+				assert.Contains(t, location, runtime.AppURL)
+			},
+		},
+		{
+			description: "Should add basic auth if it's in ACLs",
+			middlewares: []gin.HandlerFunc{
+				simpleCtx,
+			},
+			run: func(t *testing.T, router *gin.Engine, recorder *httptest.ResponseRecorder) {
+				req := httptest.NewRequest("GET", "/api/auth/traefik", nil)
+				req.Header.Set("x-forwarded-host", "basic-auth.example.com")
+				req.Header.Set("x-forwarded-proto", "https")
+				req.Header.Set("x-forwarded-uri", "/")
+				req.Header.Set("authorization", "foo") // should be overridden by basic auth
+				router.ServeHTTP(recorder, req)
+
+				assert.Equal(t, http.StatusOK, recorder.Code)
+				authorizationHeader := recorder.Header().Get("Authorization")
+				assert.NotEmpty(t, authorizationHeader)
+				assert.Equal(t, fmt.Sprintf("Basic %s", base64.StdEncoding.EncodeToString([]byte("test:password"))), authorizationHeader)
+			},
+		},
+		{
+			description: "Authorization header should be preserved when not basic auth acls",
+			middlewares: []gin.HandlerFunc{
+				simpleCtx,
+			},
+			run: func(t *testing.T, router *gin.Engine, recorder *httptest.ResponseRecorder) {
+				req := httptest.NewRequest("GET", "/api/auth/traefik", nil)
+				req.Header.Set("x-forwarded-host", "test.example.com")
+				req.Header.Set("x-forwarded-proto", "https")
+				req.Header.Set("x-forwarded-uri", "/")
+				req.Header.Set("authorization", "Bearer mytoken")
+				router.ServeHTTP(recorder, req)
+
+				assert.Equal(t, http.StatusOK, recorder.Code)
+				authorizationHeader := recorder.Header().Get("Authorization")
+				assert.NotEmpty(t, authorizationHeader)
+				assert.Equal(t, "Bearer mytoken", authorizationHeader)
+			},
+		},
+		{
+			description: "Should add response headers if present",
+			middlewares: []gin.HandlerFunc{
+				simpleCtx,
+			},
+			run: func(t *testing.T, router *gin.Engine, recorder *httptest.ResponseRecorder) {
+				req := httptest.NewRequest("GET", "/api/auth/traefik", nil)
+				req.Header.Set("x-forwarded-host", "response-headers.example.com")
+				req.Header.Set("x-forwarded-proto", "https")
+				req.Header.Set("x-forwarded-uri", "/")
+				router.ServeHTTP(recorder, req)
+
+				assert.Equal(t, http.StatusOK, recorder.Code)
+				assert.Equal(t, "bar", recorder.Header().Get("x-foo"))
 			},
 		},
 	}
@@ -432,7 +734,7 @@ func TestProxyController(t *testing.T) {
 
 			recorder := httptest.NewRecorder()
 
-			controller.NewProxyController(controller.ProxyControllerInput{
+			NewProxyController(ProxyControllerInput{
 				Log:           log,
 				RuntimeConfig: &runtime,
 				RouterGroup:   group,
